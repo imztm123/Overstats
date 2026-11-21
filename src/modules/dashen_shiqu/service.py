@@ -698,13 +698,27 @@ def _player_primary_role(player_segments, fallback_player) -> str:
     return best_role
 
 
-def _fmt_compact_num(v):
+def _is_rate_stat_name(nm: str) -> bool:
+    """判断统计项是否为比率类（命中率 / 占比 / 参与率 …），这类保留 1 位小数。"""
+    return ("率" in nm) or ("占比" in nm)
+
+
+def _fmt_compact_num(v, is_rate: bool = False):
+    """数值格式化（喂给模型前的显示口径）。
+
+    计数类统计（消灭 / 阵亡 / 最后一击 / 治疗量 …）按 per-10min 归一化后常带小数
+    （如 26.56 消灭、0.97 阵亡），直接展示会被模型原样抄进点评，观感很差。
+    这里统一取整；比率类（命中率 / 占比等）保留 1 位小数。
+    """
     if v is None:
         return None
     f = float(v)
-    if abs(f - round(f)) < 1e-9:
-        return int(round(f))
-    return round(f, 2)
+    if is_rate:
+        r = round(f, 1)
+        return int(r) if abs(r - round(r)) < 1e-9 else r
+    if f >= 0:
+        return int(f + 0.5)
+    return -int(-f + 0.5)
 
 
 # 消灭参与率计算用到的原始统计 guid（与旧版 _build_prompt 口径一致）。
@@ -745,7 +759,7 @@ def _fmt_hero_line(seg, db) -> str:
         nv = normalize_stat_value(sm.get(g), ut, value_text=nm, value_guid=g)
         if nv is None:
             continue
-        common_parts.append(f"{short}={_fmt_compact_num(nv)}")
+        common_parts.append(f"{short}={_fmt_compact_num(nv, _is_rate_stat_name(nm))}")
         ref_guids.add(g)
 
     special_parts: list = []
@@ -758,7 +772,7 @@ def _fmt_hero_line(seg, db) -> str:
         nv = normalize_stat_value(sm.get(g), ut, value_text=nm, value_guid=g)
         if nv is None:
             continue
-        special_parts.append(f"{nm}={_fmt_compact_num(nv)}")
+        special_parts.append(f"{nm}={_fmt_compact_num(nv, True)}")
         ref_guids.add(g)
 
     parts = [f"h={hn}", f"t={int(round(ut))}"] + common_parts + special_parts
@@ -772,13 +786,13 @@ def _fmt_hero_line(seg, db) -> str:
                 if g in ref_guids:
                     nm = name_map.get(g, "")
                     if nm in ref_map:
-                        ref_items.append(f"{short}={_fmt_compact_num(ref_map[nm])}")
+                        ref_items.append(f"{short}={_fmt_compact_num(ref_map[nm], _is_rate_stat_name(nm))}")
             for g in _HERO_SPECIAL_ATTR_GUIDS.get(hg, set()):
                 if g in _STAT_GUID_TO_SHORT or g not in ref_guids:
                     continue
                 nm = name_map.get(g, "")
                 if nm in ref_map:
-                    ref_items.append(f"{nm}={_fmt_compact_num(ref_map[nm])}")
+                    ref_items.append(f"{nm}={_fmt_compact_num(ref_map[nm], True)}")
             if ref_items:
                 line += " | ref:" + " ".join(ref_items)
     return line
@@ -881,7 +895,7 @@ def _fmt_match_block(m: dict, target_id: str, idx: int, db) -> str:
         name = str(p.get("name", "?"))
         display = f"*{name}" if name == target_id else name
         pr = _compute_pr(p, enemy_total_deaths)
-        lines.append(f"{pos}|{display}|{pr:.3f}")
+        lines.append(f"{pos}|{display}|{pr * 100:.1f}%")
         for seg in segs:
             lines.append(_fmt_hero_line(seg, db))
     return "\n".join(lines)
