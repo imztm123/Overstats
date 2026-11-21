@@ -81,12 +81,12 @@ OW_GUESS_ASSET_ROOT = 'ow_guess_assets'
 
 # ======================= Dashen Season ===================== #
 # 自动取 max(DASHEN_CURRENT_SEASON, AIEvaluateConfig[*].seasonIdList)；
-# 新赛季开启后记得同步这里（上游当前默认 25）。
-DASHEN_CURRENT_SEASON = 25
+# 与插件面板 dashen_current_season 默认值保持一致；新赛季开启后两处一起改。
+DASHEN_CURRENT_SEASON = 24
 DASHEN_HISTORY_START_SEASON = 15
 
 # ======================= OW Hero Leaderboard =============== #
-OW_HERO_LEADERBOARD_CN_SEASON = 5
+OW_HERO_LEADERBOARD_CN_SEASON = 4
 
 # ======================= Match Analysis ==================== #
 # 兼容 OpenAI 协议的服务地址，例如：
