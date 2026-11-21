@@ -1,0 +1,683 @@
+from __future__ import annotations
+
+from ..dashen_promo import append_dashen_promo, mark_promo_reserved, promo_reserve_height
+
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, List, Sequence
+
+try:
+    from overstats.src.constants.backgrounds import build_random_map_background
+except ModuleNotFoundError:
+    from src.constants.backgrounds import build_random_map_background
+
+try:
+    from overstats.src.modules.query_tool import get_cached_asset_path, load_query_tool
+except ModuleNotFoundError:
+    from src.modules.query_tool import get_cached_asset_path, load_query_tool
+
+try:
+    from overstats.src.constants.ranks import get_rank_score, get_rank_sub_tier, raw_rank_score_to_icon_level, rank_info_to_icon_level
+except ModuleNotFoundError:
+    from src.constants.ranks import get_rank_score, get_rank_sub_tier, raw_rank_score_to_icon_level, rank_info_to_icon_level
+
+try:
+    from overstats.src.modules.font_resolver import load_font, resolve_resource_dir
+    from overstats.src.modules.risk_status import draw_risk_status_badge
+except ModuleNotFoundError:
+    from src.modules.font_resolver import load_font, resolve_resource_dir
+    from src.modules.risk_status import draw_risk_status_badge
+
+from ..dashen_summary.runtime.summary_style import C, RADIUS_CARD, RADIUS_TILE, mix, themed, vertical_scrim
+from ..dashen_summary.runtime.summary_typography import SmoothDraw, smooth_mask
+from .requests import fight_payload_has_content, payload_data, sport_payload_has_content
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+RESOURCE_DIR = resolve_resource_dir()
+SEASON_LOGO_DIR = RESOURCE_DIR / "season_logo"
+RANK_FLAT_DIR = RESOURCE_DIR / "rank_flat"
+QUERY_TOOL_ASSET_DIR = RESOURCE_DIR / "query_tool_assets"
+HISTORY_SUBTITLE = "历史段位"
+CARD_W, CARD_H = 500, 1000
+BANNER_H = 176
+HERO_TOP = 292
+COMPETITIVE_TOP = 460
+STADIUM_TOP = 726
+RANK_TEXT = (22, 25, 32)
+_FONT_CACHE: Dict[Any, Any] = {}
+ROLE_ORDER = {"tank": 0, "dps": 1, "healer": 2, "open": 3}
+ROLE_LABELS = {
+    "tank": "重装",
+    "dps": "输出",
+    "healer": "支援",
+    "open": "开放",
+}
+ROLE_ICON_FILENAMES = {
+    "tank": "tank.png",
+    "dps": "dps.png",
+    "healer": "healer.png",
+}
+
+
+@dataclass(frozen=True)
+class RenderedImage:
+    content: bytes
+    media_type: str = "image/png"
+
+
+def collect_missing_assets(seasons: Sequence[Dict[str, Any]]) -> List[str]:
+    missing: List[str] = []
+    seen = set()
+
+    def _append(path: str) -> None:
+        if path in seen:
+            return
+        seen.add(path)
+        missing.append(path)
+
+    if not (RESOURCE_DIR / "comp.png").exists():
+        if any(bool(item.get("has_competitive")) for item in seasons):
+            _append("overstats/res/comp.png")
+
+    if not (RESOURCE_DIR / "fight.png").exists():
+        if any(bool(item.get("has_stadium")) for item in seasons):
+            _append("overstats/res/fight.png")
+
+    for filename in ROLE_ICON_FILENAMES.values():
+        if not (RESOURCE_DIR / filename).exists():
+            _append(f"overstats/res/{filename}")
+
+    for item in seasons:
+        season = int(item.get("season") or 0)
+        if season <= 0:
+            continue
+        if not _season_banner_path(season).exists():
+            _append(f"overstats/res/season_logo/s{season}.png")
+        for payload_key, rows_key, prefix in (
+            ("sport_payload", "guideCountData", ""),
+            ("fight_payload", "roleTypeCountData", "c"),
+        ):
+            for row in payload_data(item.get(payload_key)).get(rows_key, []) or []:
+                if not isinstance(row, dict):
+                    continue
+                for key in ("lastRankInfo", "maxRankInfo"):
+                    info = row.get(key)
+                    if not isinstance(info, dict):
+                        continue
+                    level = raw_rank_score_to_icon_level(get_rank_score(info)) if prefix else rank_info_to_icon_level(info)
+                    filename = f"{prefix}{level}.png"
+                    if level > 0 and not (RANK_FLAT_DIR / filename).exists():
+                        _append(f"overstats/res/rank_flat/{filename}")
+    return missing
+
+
+@themed
+def render_rank_history(
+    *,
+    player_name: str,
+    subtitle: str = HISTORY_SUBTITLE,
+    seasons: Sequence[Dict[str, Any]],
+    risk_status: Any = None,
+) -> RenderedImage:
+    try:
+        from PIL import Image  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("render.py requires Pillow to output images") from exc
+
+    config = _load_ow_config()
+    season_cards = [_render_season_card(item, config) for item in seasons]
+
+    if season_cards:
+        max_per_row = 5
+        columns = min(len(season_cards), max_per_row)
+        rows = (len(season_cards) - 1) // max_per_row + 1
+        canvas_width = 6 + columns * 512
+        canvas_height = 1080 * rows
+        image = _load_background(canvas_width, canvas_height)
+        for index, card in enumerate(season_cards):
+            row = index // max_per_row
+            col = index % max_per_row
+            image.paste(card, (6 + col * 512, 40 + row * 1080), card)
+    else:
+        image = _load_background(518, 1080)
+        draw = _new_draw(image)
+        fonts = _load_fonts()
+        draw.rounded_rectangle((40, 160, 478, 920), radius=RADIUS_CARD + 4, fill=C.SURFACE, outline=C.STROKE, width=1)
+        draw.text((259, 440), "NO HISTORY", font=fonts["font_en_large"], fill=C.INK, anchor="mm")
+        draw.text((259, 540), "未找到历史段位数据", font=fonts["font_cn"], fill=C.MUTED, anchor="mm")
+
+    canvas = _decorate_with_header(image, player_name=player_name, subtitle=subtitle, risk_status=risk_status)
+    output = BytesIO()
+    canvas = append_dashen_promo(canvas)
+    canvas.save(output, format="PNG")
+    return RenderedImage(content=output.getvalue())
+
+
+def _new_draw(image: Any) -> Any:
+    return SmoothDraw(
+        image,
+        "RGBA",
+        numeric_font_path=RESOURCE_DIR / "GrotaRoundedExtraBold.otf",
+        latin_font_path=RESOURCE_DIR / "en2.ttf",
+    )
+
+
+def _render_season_card(item: Dict[str, Any], config: Dict[str, Any]) -> Any:
+    from PIL import Image
+
+    rect = Image.new("RGBA", (CARD_W, CARD_H), (*C.SURFACE[:3], 255))
+    draw = _new_draw(rect)
+    fonts = _load_fonts()
+
+    season = int(item.get("season") or 0)
+    sport_payload = item.get("sport_payload")
+    fight_payload = item.get("fight_payload")
+    sport_data = payload_data(sport_payload)
+    fight_data = payload_data(fight_payload)
+
+    _paste_season_banner(rect, season)
+    draw.text((20, 184), f"SEASON {season}", font=fonts["font_season_title"], fill=C.INK)
+    _draw_season_desc(draw, config, season, fonts)
+
+    if sport_payload and sport_payload_has_content(sport_payload):
+        _draw_competitive_block(rect, draw, sport_data, fonts)
+        _draw_top_heroes(
+            rect,
+            draw,
+            config,
+            list(sport_data.get("frequentHeroIds") or []),
+            fonts,
+        )
+    else:
+        _draw_empty_mode_block(rect, draw, title="COMPETITIVE", top=COMPETITIVE_TOP, fonts=fonts)
+        fallback_heroes = [
+            str(hero.get("heroGuid") or "")
+            for hero in list(fight_data.get("heroUseSummaryList") or [])
+            if isinstance(hero, dict) and str(hero.get("heroGuid") or "").strip()
+        ]
+        _draw_top_heroes(rect, draw, config, fallback_heroes, fonts)
+
+    if fight_payload and fight_payload_has_content(fight_payload):
+        _draw_stadium_block(rect, draw, fight_data, fonts)
+    else:
+        _draw_empty_mode_block(rect, draw, title="STADIUM", top=STADIUM_TOP, fonts=fonts)
+
+    draw.rounded_rectangle((0, 0, CARD_W - 1, CARD_H - 1), radius=RADIUS_CARD + 4, outline=C.STROKE, width=1)
+    rect.putalpha(smooth_mask(CARD_W, CARD_H, RADIUS_CARD + 4))
+    return rect
+
+
+def _draw_competitive_block(rect: Any, draw: Any, sport_data: Dict[str, Any], fonts: Dict[str, Any]) -> None:
+    _draw_rank_block(rect, draw, sport_data.get("guideCountData") or [],
+                     title="竞技比赛", icon="comp.png", top=COMPETITIVE_TOP, prefix="", fonts=fonts)
+
+
+def _draw_stadium_block(rect: Any, draw: Any, fight_data: Dict[str, Any], fonts: Dict[str, Any]) -> None:
+    _draw_rank_block(rect, draw, fight_data.get("roleTypeCountData") or [],
+                     title="角斗领域", icon="fight.png", top=STADIUM_TOP, prefix="c", fonts=fonts)
+
+
+def _draw_rank_block(rect: Any, draw: Any, rows: Sequence[Dict[str, Any]], *,
+                     title: str, icon: str, top: int, prefix: str, fonts: Dict[str, Any]) -> None:
+    _draw_mode_panel(draw, top)
+    _paste_mode_icon(rect, icon, (24, top), (32, 32))
+    draw.text((66, top + 16), title, font=fonts["font_cn_title"], fill=C.INK, anchor="lm")
+    for x, label in ((28, "职责"), (186, "当前"), (310, "最高"), (432, "胜 / 场")):
+        draw.text((x, top + 45), label, font=fonts["font_cn_small_ex"],
+                  fill=C.MUTED, anchor="mt" if x > 28 else "lt")
+    role_rows = sorted((row for row in rows if isinstance(row, dict)),
+                       key=lambda row: ROLE_ORDER.get(_normalize_role_type(row.get("roleType")), 99))
+    for index, row in enumerate(role_rows[:4]):
+        y = top + 72 + index * 43
+        if index:
+            draw.line((24, y - 4, 476, y - 4), fill=C.HAIRLINE, width=1)
+        _draw_role_row(rect, draw, row=row, top_y=y, label_y=y + 8,
+                       mode_prefix=prefix, fonts=fonts)
+
+
+def _draw_mode_panel(draw: Any, top: int) -> None:
+    draw.rounded_rectangle((12, top - 8, CARD_W - 13, top + 246), radius=RADIUS_TILE, fill=C.SURFACE_SUNKEN)
+
+
+def _draw_role_row(
+    rect: Any,
+    draw: Any,
+    *,
+    row: Dict[str, Any],
+    top_y: int,
+    label_y: int,
+    mode_prefix: str,
+    fonts: Dict[str, Any],
+) -> None:
+    role_type = _normalize_role_type(row.get("roleType"))
+    role_icon = _load_role_icon(role_type, size=(28, 28))
+    label_x = 30
+    if role_icon is not None:
+        rect.paste(role_icon, (28, top_y + 4), role_icon)
+        label_x = 64
+    draw.text((label_x, label_y), ROLE_LABELS.get(role_type, role_type.upper()), font=fonts["font_cn_small_ex"], fill=C.INK)
+    last_rank_info = row.get("lastRankInfo") if isinstance(row.get("lastRankInfo"), dict) else {}
+    max_rank_info = row.get("maxRankInfo") if isinstance(row.get("maxRankInfo"), dict) else {}
+    _paste_rank_bar(rect, draw, last_rank_info, x=130, y=top_y, prefix=mode_prefix, fonts=fonts)
+    _paste_rank_bar(rect, draw, max_rank_info, x=254, y=top_y, prefix=mode_prefix, fonts=fonts)
+
+    match_sum = _safe_int(row.get("matchSum"))
+    win_rate = _safe_float(row.get("winRate"))
+    win_sum = int(match_sum * win_rate / 100) if match_sum > 0 else 0
+    draw.text((432, label_y), f"{win_sum} / {match_sum}", font=fonts["font_cn_small_ex"], fill=C.TEXT, anchor="mt")
+
+
+def _paste_rank_bar(
+    rect: Any,
+    draw: Any,
+    rank_info: Dict[str, Any],
+    *,
+    x: int,
+    y: int,
+    prefix: str,
+    fonts: Dict[str, Any],
+) -> None:
+    score = _safe_int(get_rank_score(rank_info))
+    tier = _safe_int(get_rank_sub_tier(rank_info))
+    rank_level = raw_rank_score_to_icon_level(score) if prefix else rank_info_to_icon_level(rank_info)
+    if score <= 0 and rank_level <= 0:
+        draw.text((x + 57, y + 10), "未定级", font=fonts["font_cn_small_ex"], fill=C.FAINT, anchor="mt")
+        return
+
+    asset = RANK_FLAT_DIR / f"{prefix}{rank_level}.png"
+    rank_image = _load_local_rgba(asset)
+    if rank_image is not None:
+        from PIL import Image
+
+        rank_image = rank_image.resize((115, 37), Image.Resampling.LANCZOS)
+        rect.paste(rank_image, (x, y), rank_image)
+    else:
+        draw.rounded_rectangle((x, y, x + 115, y + 37), radius=6, fill=C.MUTED)
+    draw.text((x + 83, y + 18), str(tier), font=fonts["font_num"], fill=RANK_TEXT, anchor="mm")
+
+
+def _draw_top_heroes(
+    rect: Any,
+    draw: Any,
+    config: Dict[str, Any],
+    hero_guids: Sequence[str],
+    fonts: Dict[str, Any],
+) -> None:
+    from PIL import Image, ImageOps
+
+    display_count = 0
+    for hero_guid in hero_guids:
+        hero_guid_text = str(hero_guid or "").strip()
+        if not hero_guid_text:
+            continue
+        hero_info = _find_hero(config, hero_guid_text)
+        if not hero_info:
+            continue
+        hero_name = str(hero_info.get("name") or hero_guid_text)
+        ring_color = mix(C.INK, _hero_ring_color(config, hero_name), .22)
+        icon = _load_remote_asset_image(str(hero_info.get("icon") or ""), category="heroes")
+        if icon is None:
+            continue
+        x = display_count * 155 + 30
+        y = HERO_TOP
+        portrait = ImageOps.fit(icon, (128, 128), method=Image.LANCZOS)
+        rect.paste(portrait, (x, y), smooth_mask(128, 128, 64))
+        draw.ellipse((x - 1, y - 1, x + 128, y + 128), outline=ring_color, width=6)
+        draw.text((x + 64, y + 145), hero_name, font=fonts["font_cn_small"], fill=C.INK, anchor="mm")
+        display_count += 1
+        if display_count >= 3:
+            break
+
+
+def _draw_empty_mode_block(rect: Any, draw: Any, *, title: str, top: int, fonts: Dict[str, Any]) -> None:
+    icon_name = "comp.png" if title == "COMPETITIVE" else "fight.png"
+    label = "竞技比赛" if title == "COMPETITIVE" else "角斗领域"
+    _draw_mode_panel(draw, top)
+    _paste_mode_icon(rect, icon_name, (24, top), (32, 32))
+    draw.text((66, top + 16), label, font=fonts["font_cn_title"], fill=C.INK, anchor="lm")
+    draw.text((250, top + 132), "无赛季数据", font=fonts["font_cn_small"], fill=C.FAINT, anchor="mm")
+
+
+def _draw_season_desc(draw: Any, config: Dict[str, Any], season: int, fonts: Dict[str, Any]) -> None:
+    season_info = config.get("seasonList", {}).get(str(season), {})
+    if not isinstance(season_info, dict):
+        return
+    desc = str(season_info.get("desc") or "").strip()
+    start = str(season_info.get("startTime") or "").strip()
+    end = str(season_info.get("endTime") or "").strip()
+    parts = [part for part in (desc, f"{start}-{end}" if start or end else "") if part]
+    if parts:
+        text = " ".join(parts)
+        while text and _measure_text_width(draw, text, fonts["font_cn_small_ex"]) > 460:
+            text = text[:-2] + "…"
+        draw.text((22, 262), text, font=fonts["font_cn_small_ex"], fill=C.MUTED)
+
+
+def _season_banner_path(season):
+    for directory in (SEASON_LOGO_DIR, QUERY_TOOL_ASSET_DIR / "season_banners"):
+        for suffix in (".png", ".jpg", ".webp", ".jpeg"):
+            path = directory / f"s{season}{suffix}"
+            if path.is_file():
+                return path
+    return SEASON_LOGO_DIR / f"s{season}.png"
+
+
+_banner_checked_at = 0.0
+
+
+async def ensure_season_banners(seasons):
+    import asyncio
+    import html
+    import re
+    import time
+    import httpx
+    from PIL import Image
+
+    global _banner_checked_at
+    missing = {int(item.get("season") or 0) for item in seasons if int(item.get("season") or 0)>0 and not _season_banner_path(int(item["season"])).exists()}
+    if not missing or time.monotonic() - _banner_checked_at < 3600:
+        return
+    _banner_checked_at = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            response = await client.get("https://overwatch.blizzard.com/en-us/news/")
+            response.raise_for_status()
+            candidates = {}
+            for card in re.findall(r'<a\b[^>]*>.*?</a>', response.text, re.S):
+                title_match = re.search(r'<h[1-6][^>]*>(.*?)</h[1-6]>', card, re.S)
+                image_match = re.search(r'<blz-image[^>]*src="([^"]+)"', card)
+                date_match = re.search(r'timestamp="(\d{4})', card)
+                if not title_match or not image_match or not date_match:
+                    continue
+                title = html.unescape(re.sub('<[^>]+>', '', title_match[1]))
+                number = re.search(r'\bSeason\s+(\d+)\b', title, re.I)
+                if not number or re.search(r'mid.?cycle|mid.?season|director|recall|trailer|trials', title, re.I):
+                    continue
+                year, season = int(date_match[1]), int(number[1])
+                # 2026 restarted public season numbering; Dashen continues at 21.
+                if year == 2026 and 'reign of talon' in title.lower():
+                    season += 20
+                elif year >= 2026:
+                    continue
+                if season in missing:
+                    candidates.setdefault(season, html.unescape(image_match[1]))
+            directory = QUERY_TOOL_ASSET_DIR / "season_banners"
+            for season, url in candidates.items():
+                try:
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    with Image.open(BytesIO(response.content)) as source:
+                        source.load()
+                        banner = source.convert("RGBA")
+                    directory.mkdir(parents=True, exist_ok=True)
+                    path = directory / f"s{season}.png"
+                    temporary = path.with_suffix(".tmp")
+                    banner.save(temporary, format="PNG")
+                    temporary.replace(path)
+                except (httpx.HTTPError, OSError, ValueError):
+                    continue
+    except (httpx.HTTPError, OSError, ValueError):
+        return
+
+
+def _paste_season_banner(rect: Any, season: int) -> None:
+    from PIL import Image, ImageDraw
+
+    # Keep every season card aligned even when its artwork is unavailable.
+    ImageDraw.Draw(rect).rectangle((0, 0, CARD_W - 1, BANNER_H - 1), fill=(*C.SURFACE_RAISED[:3], 255))
+    banner = _load_local_rgba(_season_banner_path(season))
+    if banner is None:
+        return
+    target_width = CARD_W
+    max_height = BANNER_H
+    width, height = banner.size
+    if width <= 0 or height <= 0:
+        return
+    scale = target_width / width
+    new_height = int(height * scale)
+    banner = banner.resize((target_width, new_height), Image.LANCZOS)
+    if new_height > max_height:
+        top = (new_height - max_height) // 2
+        banner = banner.crop((0, top, target_width, top + max_height))
+    rect.paste(banner, (0, 0), banner)
+
+
+def _paste_mode_icon(rect: Any, filename: str, position: tuple[int, int], size: tuple[int, int]) -> None:
+    from PIL import Image
+
+    icon = _load_local_rgba(RESOURCE_DIR / filename)
+    if icon is None:
+        return
+    icon = icon.resize(size, Image.LANCZOS)
+    rect.paste(icon, position, icon)
+
+
+def _normalize_role_type(role_type: Any) -> str:
+    normalized = str(role_type or "").strip().lower()
+    if normalized == "support":
+        return "healer"
+    return normalized
+
+
+def _load_role_icon(role_type: Any, *, size: tuple[int, int]) -> Any:
+    from PIL import Image
+
+    filename = ROLE_ICON_FILENAMES.get(_normalize_role_type(role_type))
+    if not filename:
+        return None
+    icon = _load_local_rgba(RESOURCE_DIR / filename)
+    if icon is None:
+        return None
+    if C.ROLE_ICON:
+        inked = Image.new("RGBA", icon.size, (*C.ROLE_ICON, 255))
+        inked.putalpha(icon.getchannel("A"))
+        icon = inked
+    return icon.resize(size, Image.LANCZOS)
+
+
+def _decorate_with_header(base_image: Any, *, player_name: str, subtitle: str, risk_status: Any = None) -> Any:
+    from PIL import Image
+
+    header_height = 88
+    # 底部一次性预留 promo 高度，避免最后 append 再复制整图。
+    promo_height = promo_reserve_height(base_image.width, compact=True)
+    canvas = Image.new(
+        "RGBA",
+        (base_image.width, base_image.height + header_height + promo_height),
+        (*C.SCRIM, 255),
+    )
+    canvas.paste(base_image, (0, header_height), base_image)
+    if promo_height:
+        mark_promo_reserved(canvas, promo_height)
+    draw = _new_draw(canvas)
+    fonts = _load_fonts()
+
+    raw_name = str(player_name or "").strip()
+    display_name = raw_name
+    sub_parts = []
+    if "#" in raw_name:
+        battletag, battlenum = raw_name.split("#", 1)
+        display_name = battletag.strip() or raw_name
+        if battlenum.strip():
+            sub_parts.append(f"#{battlenum.strip()}")
+    if subtitle:
+        sub_parts.append(str(subtitle).strip())
+
+    name_text = display_name.upper() if display_name.isascii() else display_name
+    name_font = fonts["font_player_name"] if not name_text.isascii() else fonts["font_en_name"]
+    draw.text((24, 32), name_text, font=name_font, fill=C.INK, anchor="lm")
+    name_width = _measure_text_width(draw, name_text, name_font)
+    draw_risk_status_badge(
+        draw,
+        24 + name_width + 14,
+        17,
+        risk_status,
+        font=fonts["font_cn_small_ex"],
+        padding_x=8,
+        padding_y=4,
+        max_width=max(0, canvas.width - 24 - name_width - 28),
+    )
+    if sub_parts:
+        draw.text((24, 66), " · ".join(sub_parts), font=fonts["font_cn_small_ex"], fill=C.MUTED, anchor="lm")
+    draw.line((0, header_height - 1, canvas.width, header_height - 1), fill=C.STROKE, width=1)
+    return canvas
+
+
+def _load_background(width: int, height: int) -> Any:
+    from PIL import Image
+
+    size = (width, height)
+    background = build_random_map_background(
+        size,
+        blur_radius=50,
+        overlay=C.PAGE_OVERLAY,
+        brightness=C.PAGE_BRIGHTNESS,
+        color=C.PAGE_COLOR,
+    )
+    if background is None:
+        return Image.new("RGBA", size, (*C.SCRIM, 255))
+    return Image.alpha_composite(background, vertical_scrim(size, 0, C.PAGE_FADE))
+
+
+def _load_remote_asset_image(url: str, *, category: str) -> Any:
+    from PIL import Image
+
+    asset_path = _find_cached_asset_path(url, category=category)
+    if asset_path is None or not asset_path.exists():
+        return None
+    try:
+        return Image.open(asset_path).convert("RGBA")
+    except Exception:
+        return None
+
+
+def _find_cached_asset_path(url: str, *, category: str) -> Path | None:
+    normalized = str(url or "").strip()
+    if not normalized:
+        return None
+
+    asset_path = get_cached_asset_path(normalized, category)
+    if asset_path is not None and asset_path.exists():
+        return asset_path
+
+    stem = _asset_hash(normalized)
+    if QUERY_TOOL_ASSET_DIR.exists():
+        for candidate in QUERY_TOOL_ASSET_DIR.rglob(f"{stem}.*"):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _asset_hash(url: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(str(url or "").strip().encode("utf-8")).hexdigest()[:24]
+
+
+def _load_ow_config() -> Dict[str, Any]:
+    try:
+        return load_query_tool()
+    except Exception as exc:
+        print(f"[overstats] failed to load query_tool config for rank history render: {exc}")
+        return {}
+
+
+def _find_hero(config: Dict[str, Any], hero_guid: str) -> Dict[str, Any]:
+    for hero in config.get("heroList", []) or []:
+        if str(hero.get("heroGuid") or hero.get("heroId") or hero.get("guid") or hero.get("id") or "") == hero_guid:
+            return hero
+    return {}
+
+
+def _hero_ring_color(config: Dict[str, Any], hero_name: str) -> tuple[int, int, int, int]:
+    hero_config = config.get("heroConfig")
+    if isinstance(hero_config, dict):
+        for item in hero_config.values():
+            if str(item.get("Name") or "") == hero_name:
+                try:
+                    return hex_to_rgba(str(item.get("Color") or "#808080"))
+                except Exception:
+                    break
+    return (128, 128, 128, 255)
+
+
+def _measure_text_width(draw: Any, text: str, font: Any) -> int:
+    try:
+        return int(draw.textlength(text, font=font))
+    except Exception:
+        try:
+            box = draw.textbbox((0, 0), text, font=font)
+            return int(box[2] - box[0])
+        except Exception:
+            return 0
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _load_local_rgba(path: Path) -> Any:
+    from PIL import Image
+
+    if not path.exists():
+        return None
+    try:
+        return Image.open(path).convert("RGBA")
+    except Exception:
+        return None
+
+
+def _ui_font(size: int, *, bold: bool = False) -> Any:
+    key = ("ui", int(size), bool(bold))
+    font = _FONT_CACHE.get(key)
+    if font is None:
+        font = load_font(int(size), name="simhei.ttf", fallback="GrotaRoundedExtraBold.otf", prefer_cjk=True, bold=bold)
+        if bold and Path(getattr(font, "path", "")).name.lower() == "simhei.ttf":
+            font.emulate_bold = True
+        _FONT_CACHE[key] = font
+    return font
+
+
+def _display_font(size: int) -> Any:
+    key = ("display", int(size))
+    font = _FONT_CACHE.get(key)
+    if font is None:
+        font = load_font(int(size), name="bignoodletoooblique.ttf", fallback="BigNoodleToo.ttf")
+        font.keep_face = True
+        _FONT_CACHE[key] = font
+    return font
+
+
+def _load_fonts() -> Dict[str, Any]:
+    return {
+        "font_en_large": _display_font(80),
+        "font_en_name": _display_font(46),
+        "font_player_name": _ui_font(32, bold=True),
+        "font_season_title": _display_font(80),
+        "font_cn": _ui_font(30),
+        "font_cn_title": _ui_font(25, bold=True),
+        "font_cn_small": _ui_font(25),
+        "font_cn_small_ex": _ui_font(18),
+        "font_num": _ui_font(23, bold=True),
+    }
+
+
+def hex_to_rgba(hex_color: str) -> tuple[int, int, int, int]:
+    text = str(hex_color or "").lstrip("#")
+    if len(text) == 6:
+        return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16), 255)
+    if len(text) == 8:
+        return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16), int(text[6:8], 16))
+    return (128, 128, 128, 255)

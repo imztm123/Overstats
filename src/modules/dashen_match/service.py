@@ -1,0 +1,1247 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import copy
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
+import json
+import re
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+try:
+    from overstats.config import config as app_config
+    from overstats.src.client.apiclient import DashenAPIClient
+    from overstats.src.constants.ranks import get_rank_score
+    from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
+    from overstats.src.modules.errors import ModuleError
+    from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
+except ModuleNotFoundError:
+    from config import config as app_config
+    from src.client.apiclient import DashenAPIClient
+    from src.constants.ranks import get_rank_score
+    from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
+    from src.modules.errors import ModuleError
+    from src.modules.risk_status import RiskStatus, parse_risk_status
+from ..analysis_common import LLM_SEMAPHORE
+from ..analysis_common import build_async_client as build_analysis_async_client
+from ..analysis_common import get_analysis_proxy
+
+from .enhanced_render import (
+    build_carry_index_data,
+    build_target_hero_icons,
+    calculate_match_scores,
+    decorate_rendered_image_header,
+    generate_detailed_stats_text,
+    generate_match_summary_text,
+    map_icon_image_for_match,
+    map_name_for_match,
+    render_all_players_waterfall,
+    render_analysis_report,
+    render_player_hero_detail,
+)
+from .render import (
+    RenderedImage,
+    _extract_match_detail_data,
+    _load_ow_config,
+    _sort_players,
+    render_match_detail,
+    render_match_list,
+)
+from .requests import DashenMatchDetail, DashenMatchQuery, DashenMatchRequests
+
+
+def _report_memory_cache_hit() -> None:
+    try:
+        from overstats.src.server import report_db_cache_hit
+    except ModuleNotFoundError:
+        try:
+            from src.server import report_db_cache_hit
+        except ModuleNotFoundError:
+            return
+    report_db_cache_hit("memory")
+
+
+PLAYER_TOKEN_CACHE_TTL = 600
+PLAYER_TOKEN_CACHE_MAX = 512
+PLAYER_DETAIL_CACHE_TTL = 1800
+PLAYER_DETAIL_CACHE_MAX = 512
+PLAYER_CARD_CACHE_TTL = 1800
+PLAYER_CARD_CACHE_MAX = 512
+REPLY_CONTEXT_CACHE_TTL = 1800
+REPLY_CONTEXT_CACHE_MAX = 256
+UNKNOWN_PLAYER_LABEL = "未知玩家"
+
+_CACHE_LOCK = threading.RLock()
+_PLAYER_TOKEN_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_PLAYER_DETAIL_CACHE: "OrderedDict[tuple[str, str], dict[str, Any]]" = OrderedDict()
+_PLAYER_CARD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_REPLY_CONTEXT_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+
+def _cache_get(cache: OrderedDict, key: Any) -> Any:
+    with _CACHE_LOCK:
+        item = cache.get(key)
+        if not isinstance(item, dict):
+            return None
+        if time.time() >= float(item.get("expiry", 0) or 0):
+            cache.pop(key, None)
+            return None
+        try:
+            cache.move_to_end(key)
+        except Exception:
+            pass
+        _report_memory_cache_hit()
+        return item.get("value")
+
+
+def _cache_put(cache: OrderedDict, key: Any, value: Any, *, ttl: int, max_size: int) -> None:
+    with _CACHE_LOCK:
+        now = time.time()
+        cache[key] = {"value": value, "created_at": now, "expiry": now + max(1, int(ttl))}
+        try:
+            cache.move_to_end(key)
+        except Exception:
+            pass
+        while len(cache) > max_size:
+            cache.popitem(last=False)
+
+
+def _sanitize_api_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or "replace-with-your" in text.lower():
+        return ""
+    return text
+
+
+def _analysis_model_for_base_url(base_url: str) -> str:
+    normalized = str(base_url or "").strip().lower()
+    if "generativelanguage.googleapis.com" in normalized or "googleapis.com" in normalized:
+        return str(getattr(app_config, "ANALYSIS_GOOGLE_MODEL", "gemini-3.1-flash-lite-preview") or "gemini-3.1-flash-lite-preview")
+    if "deepseek" in normalized:
+        return str(getattr(app_config, "ANALYSIS_DEEPSEEK_MODEL", "deepseek-chat") or "deepseek-chat")
+    return str(getattr(app_config, "ANALYSIS_OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini")
+
+
+def _resolved_payload(resolved: Optional[BnetSearchResult]) -> Optional[Dict[str, Any]]:
+    if not resolved:
+        return None
+    return {
+        "query": resolved.query,
+        "full_id": resolved.full_id,
+        "bnet_id": resolved.bnet_id,
+        "has_customer_token": bool(resolved.customer_token),
+    }
+
+
+def _safe_display_identity(value: Any) -> str:
+    """Return a player label only when it cannot be a rendered token label."""
+
+    text = str(value or "").strip()
+    lowered = text.casefold()
+    if lowered.startswith(("token:", "ctoken:", "customer_token:", "customer-token:", "customer:")):
+        return ""
+    return text
+
+
+def _image_reply(rendered: RenderedImage) -> Dict[str, Any]:
+    return {
+        "type": "image",
+        "media_type": rendered.media_type,
+        "base64": base64.b64encode(rendered.content).decode("ascii"),
+    }
+
+
+def _text_reply(text: str) -> Dict[str, Any]:
+    return {"type": "text", "data": str(text or "")}
+
+
+def _meta_reply(meta_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    return {"type": "meta", "meta_type": meta_type, "data": data}
+
+
+def _extract_llm_message_content(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict):
+                return str(message.get("content") or "")
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return _extract_llm_message_content(data)
+    return ""
+
+
+def _clean_llm_text(text: Any) -> str:
+    cleaned = str(text or "")
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    return cleaned
+
+
+def _parse_analysis_json(text: Any) -> Optional[Dict[str, Any]]:
+    cleaned = _clean_llm_text(text)
+    if not cleaned:
+        return None
+    candidates = [cleaned]
+    candidates.extend(re.findall(r"\{.*\}", cleaned, flags=re.DOTALL))
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+@dataclass(frozen=True)
+class DashenMatchListOutput:
+    matches: List[Dict[str, Any]]
+    customer_token: str
+    resolved_bnet: Optional[BnetSearchResult] = None
+    image: Optional[RenderedImage] = None
+    full_id: str = ""
+    risk_status: Optional[RiskStatus] = None
+    footer_lines: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DashenMatchDetailOutput:
+    detail: DashenMatchDetail
+    customer_token: str
+    resolved_bnet: Optional[BnetSearchResult] = None
+    image: Optional[RenderedImage] = None
+    detail_root: Dict[str, Any] = field(default_factory=dict)
+    query_full_id: str = ""
+    query_bnet_id: str = ""
+
+
+@dataclass(frozen=True)
+class MatchDetailRepliesFetched:
+    """对局详情 replies 的抓取阶段产物：渲染/AI 阶段只消费这些数据。"""
+
+    customer_token: str
+    resolved_bnet: Optional[BnetSearchResult] = None
+    detail: Optional[DashenMatchDetail] = None
+    detail_root: Dict[str, Any] = field(default_factory=dict)
+    source_match: Dict[str, Any] = field(default_factory=dict)
+    query_full_id: str = ""
+    query_bnet_id: str = ""
+    target_risk_status: Optional[RiskStatus] = None
+    match_kind: str = ""
+    show_all_heroes: bool = False
+    analyze: bool = False
+    all_player_details: List[Dict[str, Any]] = field(default_factory=list)
+    target_id: str = ""
+
+
+@dataclass(frozen=True)
+class DashenMatchRepliesOutput:
+    customer_token: str
+    resolved_bnet: Optional[BnetSearchResult] = None
+    replies: List[Dict[str, Any]] = field(default_factory=list)
+    match_id: str = ""
+    match_kind: str = ""
+
+
+class DashenMatchModule:
+    def __init__(
+        self,
+        api_client: Optional[DashenAPIClient] = None,
+        search_module: Optional[BnetSearchModule] = None,
+    ) -> None:
+        self.requests = DashenMatchRequests(api_client)
+        self.search_module = search_module or bnet_search_module
+
+    async def fetch_match_list(self, query: DashenMatchQuery, *, for_render: bool = False) -> DashenMatchListOutput:
+        """抓取阶段：解析 + 对局列表（+ 渲染所需 risk_status）。只含上游请求。"""
+        query, resolved_bnet = await self._resolve_query(query)
+        matches = await self.requests.list_recent_matches(query)
+        full_id = self._display_identity(query, resolved_bnet)
+        risk_status = await self._fetch_player_risk_status(query.customer_token) if for_render else None
+        footer_lines: List[str] = []
+        if for_render and query.filters:
+            labels = [f"{label}：{query.filters[key]}" for key, label in (("map", "地图"), ("hero", "英雄"), ("search", "筛选"), ("mode", "模式")) if query.filters.get(key)]
+            footer_lines = [" / ".join(labels), "检索最近两个赛季，最多显示 20 场"]
+        self._store_reply_context(query, resolved_bnet, matches)
+        return DashenMatchListOutput(
+            matches=matches,
+            customer_token=query.customer_token,
+            resolved_bnet=resolved_bnet,
+            full_id=full_id,
+            risk_status=risk_status,
+            footer_lines=footer_lines,
+        )
+
+    async def render_match_list(self, output: DashenMatchListOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
+        render_kwargs: Dict[str, Any] = {"full_id": output.full_id}
+        if output.footer_lines:
+            render_kwargs["footer_lines"] = output.footer_lines
+        if output.risk_status is not None:
+            render_kwargs["risk_status"] = output.risk_status
+        return render_match_list(output.matches, **render_kwargs)
+
+    async def query_match_list(self, query: DashenMatchQuery, *, render: bool = True) -> DashenMatchListOutput:
+        output = await self.fetch_match_list(query, for_render=render)
+        if render:
+            output = replace(output, image=await self.render_match_list(output))
+        return output
+
+    async def render_match_list_replies(self, output: DashenMatchListOutput) -> DashenMatchRepliesOutput:
+        """渲染阶段：由抓取产物生成列表图并组装 replies（槽外执行）。"""
+        image = await self.render_match_list(output)
+        replies = [
+            _meta_reply(
+                "ds_match_list",
+                {
+                    "context_type": "ds_match_list",
+                    "full_id": output.full_id,
+                    "resolved": _resolved_payload(output.resolved_bnet),
+                    "match_entries": output.matches,
+                },
+            ),
+        ]
+        if image:
+            replies.append(_image_reply(image))
+        return DashenMatchRepliesOutput(
+            customer_token=output.customer_token,
+            resolved_bnet=output.resolved_bnet,
+            replies=replies,
+        )
+
+    async def query_match_list_replies(self, query: DashenMatchQuery) -> DashenMatchRepliesOutput:
+        output = await self.fetch_match_list(query, for_render=True)
+        return await self.render_match_list_replies(output)
+
+    async def fetch_match_detail(
+        self,
+        customer_token: str,
+        match: Dict[str, Any] | str,
+        *,
+        query_full_id: str = "",
+        query_bnet_id: str = "",
+        for_render: bool = False,
+    ) -> DashenMatchDetailOutput:
+        """抓取阶段：对局详情（+ 渲染所需 risk 状态补充）。只含上游请求。"""
+        detail = await self.requests.get_match_detail(customer_token, match)
+        detail_root = await self._hydrate_match_detail_risk_statuses(detail.payload) if for_render else {}
+        return DashenMatchDetailOutput(
+            detail=detail,
+            customer_token=customer_token,
+            detail_root=detail_root,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+        )
+
+    async def render_match_detail(self, output: DashenMatchDetailOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
+        safe_query_full_id = _safe_display_identity(output.query_full_id) or UNKNOWN_PLAYER_LABEL
+        safe_query_bnet_id = _safe_display_identity(output.query_bnet_id)
+        return render_match_detail(
+            output.detail_root,
+            source_match=output.detail.source_match,
+            query_full_id=safe_query_full_id,
+            query_bnet_id=safe_query_bnet_id,
+            query_customer_token=output.customer_token,
+        )
+
+    async def query_match_detail(
+        self,
+        customer_token: str,
+        match: Dict[str, Any] | str,
+        *,
+        query_full_id: str = "",
+        query_bnet_id: str = "",
+        render: bool = True,
+    ) -> DashenMatchDetailOutput:
+        output = await self.fetch_match_detail(
+            customer_token,
+            match,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+            for_render=render,
+        )
+        if render:
+            output = replace(output, image=await self.render_match_detail(output))
+        return output
+
+    async def fetch_match_detail_by_index(
+        self,
+        query: DashenMatchQuery,
+        index: int,
+        *,
+        for_render: bool = False,
+    ) -> DashenMatchDetailOutput:
+        """抓取阶段：解析 + 列表 + 详情（+ 渲染所需 risk 状态补充）。只含上游请求。"""
+        query, resolved_bnet = await self._resolve_query(query)
+        matches = await self._list_matches_for_query(query, resolved_bnet)
+        if index < 0 or index >= len(matches):
+            raise ModuleError(
+                error="match_index_out_of_range",
+                message=f"Match index out of range: {index}",
+                status_code=400,
+                hint=f"Use an index from 0 to {max(len(matches) - 1, 0)}.",
+                details={"index": index, "match_count": len(matches)},
+            )
+        detail = await self.requests.get_match_detail(query.customer_token, matches[index])
+        detail_root = await self._hydrate_match_detail_risk_statuses(detail.payload) if for_render else {}
+        return DashenMatchDetailOutput(
+            detail=detail,
+            customer_token=query.customer_token,
+            resolved_bnet=resolved_bnet,
+            detail_root=detail_root,
+            query_full_id=resolved_bnet.full_id if resolved_bnet else query.bnet_id,
+            query_bnet_id=resolved_bnet.bnet_id if resolved_bnet else "",
+        )
+
+    async def query_match_detail_by_index(
+        self,
+        query: DashenMatchQuery,
+        index: int,
+        *,
+        render: bool = True,
+    ) -> DashenMatchDetailOutput:
+        output = await self.fetch_match_detail_by_index(query, index, for_render=render)
+        if render:
+            output = replace(output, image=await self.render_match_detail(output))
+        return output
+
+    async def fetch_match_detail_replies(
+        self,
+        *,
+        query: Optional[DashenMatchQuery] = None,
+        customer_token: str = "",
+        match_id: str = "",
+        index: Optional[int] = None,
+        show_all_heroes: bool = False,
+        analyze: bool = False,
+    ) -> MatchDetailRepliesFetched:
+        """抓取阶段：解析 + 列表 + 详情 + risk 补充 +（全员详细数据）。只含上游请求。"""
+        resolved_query: Optional[DashenMatchQuery] = None
+        resolved_bnet: Optional[BnetSearchResult] = None
+        source_match: Dict[str, Any] = {}
+
+        if match_id:
+            direct_customer_token = str(customer_token or (query.customer_token if query else "")).strip()
+            if not direct_customer_token:
+                raise ModuleError(
+                    error="missing_customer_token",
+                    message="customer_token is required when querying detail by match_id directly.",
+                    status_code=400,
+                    hint='Use {"bnet_id":"Player#12345","index":0} or provide customer_token with match_id.',
+                )
+            customer_token = direct_customer_token
+            identity_query = query or DashenMatchQuery(customer_token=customer_token)
+            try:
+                resolved_query, resolved_bnet = await self._resolve_query(identity_query)
+            except Exception:
+                resolved_query = identity_query
+                resolved_bnet = None
+            detail = await self._get_match_detail_direct(customer_token, match_id)
+        else:
+            if query is None or index is None:
+                raise ModuleError(
+                    error="missing_match_selector",
+                    message="index or match_id is required for match detail.",
+                    status_code=400,
+                    hint='Example: {"bnet_id":"Player#12345","index":0}',
+                )
+            resolved_query, resolved_bnet = await self._resolve_query(query)
+            customer_token = resolved_query.customer_token
+            matches = await self._list_matches_for_query(resolved_query, resolved_bnet)
+            if index < 0 or index >= len(matches):
+                raise ModuleError(
+                    error="match_index_out_of_range",
+                    message=f"Match index out of range: {index}",
+                    status_code=400,
+                    hint=f"Use an index from 0 to {max(len(matches) - 1, 0)}.",
+                    details={"index": index, "match_count": len(matches)},
+                )
+            source_match = dict(matches[index])
+            detail = await self.requests.get_match_detail(customer_token, source_match)
+
+        query_full_id = (
+            (resolved_bnet.full_id if resolved_bnet else "")
+            or (resolved_query.bnet_id if resolved_query else "")
+            or (query.bnet_id if query else "")
+            or UNKNOWN_PLAYER_LABEL
+        )
+        query_full_id = _safe_display_identity(query_full_id) or UNKNOWN_PLAYER_LABEL
+        query_bnet_id = _safe_display_identity(
+            (resolved_bnet.bnet_id if resolved_bnet else "") or (str(query.bnet_id or "") if query else "")
+        )
+
+        target_risk_status = await self._fetch_player_risk_status(customer_token)
+        detail_root = await self._hydrate_match_detail_risk_statuses(
+            detail.payload,
+            known_risk_statuses={customer_token: target_risk_status},
+        )
+
+        fetched = MatchDetailRepliesFetched(
+            customer_token=customer_token,
+            resolved_bnet=resolved_bnet,
+            detail=detail,
+            detail_root=detail_root,
+            source_match=source_match,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+            target_risk_status=target_risk_status,
+            match_kind=detail.match_kind,
+            show_all_heroes=show_all_heroes,
+            analyze=analyze,
+        )
+        # 角斗对局不支持全员详细/AI；其余情况在抓取阶段一次性取齐全员数据，
+        # 渲染/AI 阶段不再发起任何上游请求。
+        if detail.match_kind != "fight" and show_all_heroes:
+            all_player_details, target_id = await self._build_all_player_details(
+                detail_root,
+                detail.match_id,
+                query_full_id=query_full_id,
+                query_bnet_id=query_bnet_id,
+                query_customer_token=customer_token,
+            )
+            fetched = replace(fetched, all_player_details=all_player_details, target_id=target_id)
+        return fetched
+
+    async def render_match_detail_replies(self, fetched: MatchDetailRepliesFetched) -> DashenMatchRepliesOutput:
+        """渲染/AI 阶段：主战绩 + 全员瀑布/英雄详情 + 单局 AI。全部在抓取槽外执行。"""
+        detail = fetched.detail
+        detail_root = fetched.detail_root
+        source_match = fetched.source_match
+        query_full_id = fetched.query_full_id
+        query_bnet_id = fetched.query_bnet_id
+        target_risk_status = fetched.target_risk_status
+        customer_token = fetched.customer_token
+
+        main_image = render_match_detail(
+            detail_root,
+            source_match=detail.source_match or source_match,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+            query_customer_token=customer_token,
+        )
+        main_header_kwargs: Dict[str, Any] = {
+            "bnet_id": query_bnet_id,
+            "subtitle": "角斗对局主战绩" if detail.match_kind == "fight" else "大神对局主战绩",
+        }
+        if target_risk_status is not None:
+            main_header_kwargs["risk_status"] = target_risk_status
+        main_image = decorate_rendered_image_header(main_image, query_full_id, **main_header_kwargs)
+
+        ordered_player_ids = self._ordered_player_ids(detail_root)
+        is_competitive_match = self._is_competitive_match(detail_root, detail.match_kind, detail.source_match or source_match)
+        replies = [
+            _meta_reply(
+                "ds_match_detail_players",
+                {
+                    "context_type": "ds_match_detail_players",
+                    "player_ids": ordered_player_ids if detail.match_kind != "fight" else [],
+                    "players": self._ordered_players(detail_root) if detail.match_kind != "fight" else [],
+                    "competitive": bool(is_competitive_match),
+                },
+            ),
+            _image_reply(main_image),
+        ]
+
+        if detail.match_kind == "fight":
+            if fetched.show_all_heroes or fetched.analyze:
+                replies.append(_text_reply("角斗对局暂不支持全员详细或 AI锐评。"))
+            return DashenMatchRepliesOutput(
+                customer_token=customer_token,
+                resolved_bnet=fetched.resolved_bnet,
+                replies=replies,
+                match_id=detail.match_id,
+                match_kind=detail.match_kind,
+            )
+
+        focus_player = self._find_focus_player(
+            detail_root,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+            query_customer_token=customer_token,
+        )
+        focus_detail = {
+            "heroList": detail_root.get("heroList") or (focus_player.get("heroList") if focus_player else []) or [],
+            "rankInfo": (focus_player.get("rankInfo") if focus_player else {}) or {},
+        }
+
+        if fetched.show_all_heroes:
+            player_details = fetched.all_player_details
+            target_id = fetched.target_id
+            waterfall = render_all_players_waterfall(
+                player_details,
+                match_game_time_sec=detail_root.get("gameTimeSec"),
+            )
+            waterfall_header_kwargs: Dict[str, Any] = {"bnet_id": query_bnet_id, "subtitle": "全员详细数据"}
+            if target_risk_status is not None:
+                waterfall_header_kwargs["risk_status"] = target_risk_status
+            waterfall = decorate_rendered_image_header(waterfall, query_full_id, **waterfall_header_kwargs)
+            replies.append(_image_reply(waterfall))
+            if fetched.analyze:
+                analysis_result = await self._build_ai_analysis(
+                    match_data=detail_root,
+                    all_player_details=player_details,
+                    target_id=target_id,
+                )
+                if analysis_result.get("json") is not None:
+                    json_data = dict(analysis_result["json"])
+                    json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+                    analysis_image = render_analysis_report(
+                        json_data,
+                        target_hero_images=build_target_hero_icons(focus_detail["heroList"], size=40),
+                        risk_status=target_risk_status,
+                        map_name=map_name_for_match(detail_root),
+                        map_icon_img=map_icon_image_for_match(detail_root),
+                        match_result=self._match_result_text(detail_root),
+                        footer_source=analysis_result.get("footer_source"),
+                    )
+                    replies.append(_image_reply(analysis_image))
+                else:
+                    replies.append(_text_reply(analysis_result.get("fallback_text") or "AI锐评暂不可用。"))
+        else:
+            detail_image = render_player_hero_detail(
+                query_full_id,
+                focus_detail,
+                match_game_time_sec=detail_root.get("gameTimeSec"),
+            )
+            detail_header_kwargs: Dict[str, Any] = {"bnet_id": query_bnet_id, "subtitle": "英雄详细数据"}
+            if target_risk_status is not None:
+                detail_header_kwargs["risk_status"] = target_risk_status
+            detail_image = decorate_rendered_image_header(detail_image, query_full_id, **detail_header_kwargs)
+            replies.append(_image_reply(detail_image))
+
+        return DashenMatchRepliesOutput(
+            customer_token=customer_token,
+            resolved_bnet=fetched.resolved_bnet,
+            replies=replies,
+            match_id=detail.match_id,
+            match_kind=detail.match_kind,
+        )
+
+    async def query_match_detail_replies(
+        self,
+        *,
+        query: Optional[DashenMatchQuery] = None,
+        customer_token: str = "",
+        match_id: str = "",
+        index: Optional[int] = None,
+        show_all_heroes: bool = False,
+        analyze: bool = False,
+    ) -> DashenMatchRepliesOutput:
+        fetched = await self.fetch_match_detail_replies(
+            query=query,
+            customer_token=customer_token,
+            match_id=match_id,
+            index=index,
+            show_all_heroes=show_all_heroes,
+            analyze=analyze,
+        )
+        return await self.render_match_detail_replies(fetched)
+
+    async def query_match_list_by_bnet_id(
+        self,
+        bnet_id: str,
+        *,
+        render: bool = True,
+        **query_options: Any,
+    ) -> DashenMatchListOutput:
+        return await self.query_match_list(DashenMatchQuery(bnet_id=bnet_id, **query_options), render=render)
+
+    async def query_match_detail_by_bnet_id(
+        self,
+        bnet_id: str,
+        index: int,
+        *,
+        render: bool = True,
+        **query_options: Any,
+    ) -> DashenMatchDetailOutput:
+        return await self.query_match_detail_by_index(
+            DashenMatchQuery(bnet_id=bnet_id, **query_options),
+            index,
+            render=render,
+        )
+
+    async def _resolve_query(self, query: DashenMatchQuery) -> tuple[DashenMatchQuery, Optional[BnetSearchResult]]:
+        if query.customer_token:
+            normalized_query = DashenMatchQuery(
+                customer_token=str(query.customer_token).strip(),
+                bnet_id=_safe_display_identity(query.bnet_id),
+                seasons=query.seasons,
+                include_previous_season=query.include_previous_season,
+                include_fight=query.include_fight,
+                target_count=query.target_count,
+                filters=query.filters,
+            )
+            try:
+                card_payload = await self._fetch_cached_player_card(normalized_query.customer_token)
+            except Exception:
+                card_payload = {}
+            card_data = card_payload.get("data") if isinstance(card_payload, dict) else None
+            if not isinstance(card_data, dict):
+                return normalized_query, None
+
+            full_id = _safe_display_identity(card_data.get("name")) or normalized_query.bnet_id
+            bnet_id = str(card_data.get("bnetId") or "").strip()
+            if not full_id and not bnet_id:
+                return normalized_query, None
+
+            identity_data = dict(card_data)
+            identity_data["customerToken"] = normalized_query.customer_token
+            if full_id:
+                identity_data["name"] = full_id
+            if bnet_id:
+                identity_data["bnetId"] = bnet_id
+            resolved_bnet = BnetSearchResult(
+                query=full_id or bnet_id or "customer_token",
+                payload={"data": identity_data},
+            )
+            resolved_query = DashenMatchQuery(
+                customer_token=normalized_query.customer_token,
+                bnet_id=full_id,
+                seasons=normalized_query.seasons,
+                include_previous_season=normalized_query.include_previous_season,
+                include_fight=normalized_query.include_fight,
+                target_count=normalized_query.target_count,
+                filters=normalized_query.filters,
+            )
+            return resolved_query, resolved_bnet
+        if not query.bnet_id:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","limit":20}',
+            )
+        search_output = await self.search_module.search(query.bnet_id, render=False)
+        customer_token = search_output.result.customer_token
+        if not customer_token:
+            payload = search_output.result.payload
+            data = payload.get("data") if isinstance(payload, dict) else None
+            raise ModuleError(
+                error="bnet_not_found",
+                message=f"Could not resolve customerToken from bnet_id: {query.bnet_id}",
+                status_code=404,
+                hint=(
+                    "Check exact letter case and the number after '#'. "
+                    "Dashen search is often case-sensitive. "
+                    "If you already have customer_token, query with customer_token directly."
+                ),
+                details={
+                    "query": search_output.result.query,
+                    "upstream_code": payload.get("code") if isinstance(payload, dict) else None,
+                    "upstream_msg": payload.get("msg") if isinstance(payload, dict) else None,
+                    "has_data": isinstance(data, dict),
+                    "has_customer_token": bool(customer_token),
+                    "resolved_name": search_output.result.full_id,
+                    "resolved_bnet_id": search_output.result.bnet_id,
+                },
+            )
+        resolved_query = DashenMatchQuery(
+            customer_token=customer_token,
+            bnet_id=search_output.result.full_id,
+            seasons=query.seasons,
+            include_previous_season=query.include_previous_season,
+            include_fight=query.include_fight,
+            target_count=query.target_count,
+            filters=query.filters,
+        )
+        return resolved_query, search_output.result
+
+    def _display_identity(
+        self,
+        query: DashenMatchQuery,
+        resolved_bnet: Optional[BnetSearchResult],
+    ) -> str:
+        if resolved_bnet is not None:
+            resolved_name = _safe_display_identity(resolved_bnet.full_id)
+            if resolved_name:
+                return resolved_name
+        return _safe_display_identity(query.bnet_id) or UNKNOWN_PLAYER_LABEL
+
+    def _reply_context_cache_key(self, query: DashenMatchQuery, resolved_bnet: Optional[BnetSearchResult]) -> str:
+        return json.dumps(
+            {
+                "customer_token": query.customer_token,
+                "full_id": resolved_bnet.full_id if resolved_bnet else query.bnet_id,
+                "target_count": int(query.target_count),
+                "filters": query.filters,
+                "seasons": list(query.seasons or []),
+                "include_fight": bool(query.include_fight),
+                "include_previous_season": bool(query.include_previous_season),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _store_reply_context(
+        self,
+        query: DashenMatchQuery,
+        resolved_bnet: Optional[BnetSearchResult],
+        matches: List[Dict[str, Any]],
+    ) -> None:
+        _cache_put(
+            _REPLY_CONTEXT_CACHE,
+            self._reply_context_cache_key(query, resolved_bnet),
+            {"matches": matches, "resolved_bnet": resolved_bnet},
+            ttl=REPLY_CONTEXT_CACHE_TTL,
+            max_size=REPLY_CONTEXT_CACHE_MAX,
+        )
+
+    async def _list_matches_for_query(self, query: DashenMatchQuery, resolved_bnet: Optional[BnetSearchResult]) -> List[Dict[str, Any]]:
+        cached = _cache_get(_REPLY_CONTEXT_CACHE, self._reply_context_cache_key(query, resolved_bnet))
+        if isinstance(cached, dict) and isinstance(cached.get("matches"), list):
+            return list(cached["matches"])
+        matches = await self.requests.list_recent_matches(query)
+        self._store_reply_context(query, resolved_bnet, matches)
+        return matches
+
+    async def _get_match_detail_direct(self, customer_token: str, match_id: str) -> DashenMatchDetail:
+        last_error: Optional[Exception] = None
+        try:
+            payload = await self.requests.api_client.query_match_info(customer_token, match_id)
+            root = _extract_match_detail_data(payload)
+            if root.get("teammateList") or root.get("enemyList") or root.get("heroList"):
+                return DashenMatchDetail(match_id=match_id, match_kind="normal", payload=payload, source_match={})
+        except Exception as exc:
+            last_error = exc
+        try:
+            payload = await self.requests.api_client.fight_query_match_info(customer_token, match_id)
+            root = _extract_match_detail_data(payload)
+            if root.get("roundCountList") or root.get("totalCount") or root.get("teammateList") or root.get("enemyList"):
+                return DashenMatchDetail(match_id=match_id, match_kind="fight", payload=payload, source_match={})
+        except Exception as exc:
+            last_error = exc
+        if last_error is not None:
+            raise last_error
+        return DashenMatchDetail(match_id=match_id, match_kind="normal", payload={}, source_match={})
+
+    def _ordered_player_ids(self, detail_root: Dict[str, Any]) -> List[str]:
+        config = _load_ow_config()
+        ordered: List[str] = []
+        for team_key in ("teammateList", "enemyList"):
+            for player in _sort_players(detail_root.get(team_key, []), config):
+                name = str(player.get("name") or "").strip()
+                if name:
+                    ordered.append(name)
+        return ordered
+
+    def _ordered_players(self, detail_root: Dict[str, Any]) -> List[Dict[str, str]]:
+        config = _load_ow_config()
+        return [{"name": str(player.get("name") or "").strip(),
+                 "bnet_id": str(player.get("bnetId") or "").strip()}
+                for team_key in ("teammateList", "enemyList")
+                for player in _sort_players(detail_root.get(team_key, []), config)]
+
+    def _is_competitive_match(self, detail_root: Dict[str, Any], match_kind: str, source_match: Optional[Dict[str, Any]]) -> bool:
+        # Match mode is authoritative: a player can have a rank in a quick match.
+        for value in ((source_match or {}).get("gameMode"), detail_root.get("gameMode")):
+            mode = str(value or "").lower()
+            if any(flag in mode for flag in ("sport", "competitive", "rank")):
+                return True
+            if any(flag in mode for flag in ("quick", "leisure")):
+                return False
+        if match_kind == "fight":
+            return "sportfight" in str((source_match or {}).get("gameMode") or "").lower()
+        for player in list(detail_root.get("teammateList") or []) + list(detail_root.get("enemyList") or []):
+            rank_info = player.get("rankInfo") or player.get("rank_info") or {}
+            try:
+                if int(get_rank_score(rank_info) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return "sport" in str((source_match or {}).get("gameMode") or detail_root.get("gameMode") or "").lower()
+
+    def _find_focus_player(
+        self,
+        detail_root: Dict[str, Any],
+        *,
+        query_full_id: str,
+        query_bnet_id: str,
+        query_customer_token: str = "",
+    ) -> Dict[str, Any]:
+        normalized_full = str(query_full_id or "").strip().lower()
+        normalized_tag = normalized_full.split("#", 1)[0]
+        normalized_bnet_id = str(query_bnet_id or "").strip()
+        normalized_customer_token = str(query_customer_token or "").strip()
+        for player in list(detail_root.get("teammateList") or []) + list(detail_root.get("enemyList") or []):
+            player_name = str(player.get("name") or "").strip().lower()
+            player_tag = player_name.split("#", 1)[0]
+            player_bnet_id = str(player.get("bnetId") or "").strip()
+            player_customer_token = str(player.get("customerToken") or player.get("customer_token") or "").strip()
+            if normalized_customer_token and player_customer_token == normalized_customer_token:
+                return dict(player)
+            if normalized_bnet_id and player_bnet_id and normalized_bnet_id == player_bnet_id:
+                return dict(player)
+            if normalized_full and player_name == normalized_full:
+                return dict(player)
+            if normalized_tag and player_tag == normalized_tag:
+                return dict(player)
+        return {}
+
+    async def _build_all_player_details(
+        self,
+        detail_root: Dict[str, Any],
+        match_id: str,
+        *,
+        query_full_id: str,
+        query_bnet_id: str,
+        query_customer_token: str = "",
+    ) -> tuple[List[Dict[str, Any]], str]:
+        focus_player = self._find_focus_player(
+            detail_root,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+            query_customer_token=query_customer_token,
+        )
+        target_id = str(focus_player.get("name") or query_full_id or "").strip() or query_full_id
+        all_targets: List[Dict[str, Any]] = []
+        for team_key, team_type in (("teammateList", "teammate"), ("enemyList", "enemy")):
+            for player in detail_root.get(team_key, []) or []:
+                name = str(player.get("name") or "").strip()
+                if not name or "#" not in name:
+                    continue
+                all_targets.append(
+                    {
+                        "name": name,
+                        "team_type": team_type,
+                        "rankInfo": player.get("rankInfo") or {},
+                        "bnet_id": str(player.get("bnetId") or ""),
+                        "customer_token": str(player.get("customerToken") or player.get("customer_token") or "").strip(),
+                        "risk_status": player.get("riskStatus") or player.get("risk_status"),
+                    }
+                )
+
+        async def fetch_target(target: Dict[str, Any]) -> Dict[str, Any]:
+            full_name = str(target.get("name") or "")
+            token = str(target.get("customer_token") or "").strip()
+            if not token:
+                token = await self._resolve_player_customer_token(full_name)
+            if full_name.lower() == target_id.lower():
+                try:
+                    card_payload = await self._fetch_cached_player_card(token) if token else {}
+                except Exception:
+                    card_payload = {}
+                card_data = card_payload.get("data") if isinstance(card_payload, dict) and isinstance(card_payload.get("data"), dict) else {}
+                result = {
+                    "name": full_name,
+                    "heroList": detail_root.get("heroList") or [],
+                    "bnet_id": target.get("bnet_id") or query_bnet_id,
+                    "rankInfo": target.get("rankInfo") or {},
+                    "team_type": target.get("team_type"),
+                    "icon": str(card_data.get("icon") or "").strip(),
+                    "success": True,
+                }
+                risk_status = parse_risk_status(card_payload) or parse_risk_status(target.get("risk_status"))
+                if risk_status is not None:
+                    result["riskStatus"] = risk_status.to_dict()
+                return result
+            if not token:
+                return {"name": full_name, "team_type": target.get("team_type"), "success": False}
+            detail_payload, card_payload = await asyncio.gather(
+                self._fetch_cached_player_match_detail(token, match_id),
+                self._fetch_cached_player_card(token),
+                return_exceptions=True,
+            )
+            payload = detail_payload if isinstance(detail_payload, dict) else {}
+            root = _extract_match_detail_data(payload)
+            card_data = card_payload.get("data") if isinstance(card_payload, dict) and isinstance(card_payload.get("data"), dict) else {}
+            result = {
+                "name": full_name,
+                "heroList": root.get("heroList") or [],
+                "bnet_id": target.get("bnet_id"),
+                "rankInfo": target.get("rankInfo") or {},
+                "team_type": target.get("team_type"),
+                "icon": str(card_data.get("icon") or "").strip(),
+                "success": bool(root.get("heroList")),
+            }
+            risk_status = parse_risk_status(card_payload) or parse_risk_status(target.get("risk_status"))
+            if risk_status is not None:
+                result["riskStatus"] = risk_status.to_dict()
+            return result
+
+        results = await asyncio.gather(*(fetch_target(item) for item in all_targets), return_exceptions=True)
+        valid: List[Dict[str, Any]] = []
+        for result in results:
+            if isinstance(result, Exception) or not isinstance(result, dict):
+                continue
+            if result.get("success") and result.get("heroList"):
+                valid.append(result)
+
+        if not any(str(item.get("name") or "").lower() == target_id.lower() for item in valid) and detail_root.get("heroList"):
+            team_type = "teammate"
+            focus_name = str(focus_player.get("name") or "").strip()
+            for enemy in detail_root.get("enemyList", []) or []:
+                if str(enemy.get("name") or "").strip() == focus_name:
+                    team_type = "enemy"
+                    break
+            fallback = {
+                "name": target_id,
+                "heroList": detail_root.get("heroList") or [],
+                "bnet_id": query_bnet_id,
+                "rankInfo": focus_player.get("rankInfo") or {},
+                "team_type": team_type,
+                "icon": "",
+                "success": True,
+            }
+            fallback_risk_status = parse_risk_status(focus_player.get("riskStatus") or focus_player.get("risk_status"))
+            if fallback_risk_status is not None:
+                fallback["riskStatus"] = fallback_risk_status.to_dict()
+            valid.insert(0, fallback)
+        ordered_names = {name.lower(): idx for idx, name in enumerate(self._ordered_player_ids(detail_root))}
+        valid.sort(
+            key=lambda item: (
+                ordered_names.get(str(item.get("name") or "").lower(), 10_000),
+                0 if item.get("team_type") == "teammate" else 1,
+                str(item.get("name") or "").lower(),
+            )
+        )
+        return valid, target_id
+
+    async def _resolve_player_customer_token(self, full_name: str) -> str:
+        cache_key = str(full_name or "").strip().lower()
+        cached = _cache_get(_PLAYER_TOKEN_CACHE, cache_key)
+        if isinstance(cached, str):
+            return cached
+        try:
+            search_output = await self.search_module.search(full_name, render=False)
+        except Exception:
+            return ""
+        customer_token = search_output.result.customer_token
+        if customer_token:
+            _cache_put(_PLAYER_TOKEN_CACHE, cache_key, customer_token, ttl=PLAYER_TOKEN_CACHE_TTL, max_size=PLAYER_TOKEN_CACHE_MAX)
+        return customer_token
+
+    async def _fetch_cached_player_match_detail(self, customer_token: str, match_id: str) -> Dict[str, Any]:
+        cache_key = (str(customer_token or ""), str(match_id or ""))
+        cached = _cache_get(_PLAYER_DETAIL_CACHE, cache_key)
+        if isinstance(cached, dict):
+            return cached
+        payload = await self.requests.api_client.query_match_info(customer_token, match_id)
+        _cache_put(_PLAYER_DETAIL_CACHE, cache_key, payload, ttl=PLAYER_DETAIL_CACHE_TTL, max_size=PLAYER_DETAIL_CACHE_MAX)
+        return payload
+
+    async def _fetch_cached_player_card(self, customer_token: str) -> Dict[str, Any]:
+        cache_key = str(customer_token or "").strip()
+        if not cache_key:
+            return {}
+        cached = _cache_get(_PLAYER_CARD_CACHE, cache_key)
+        if isinstance(cached, dict):
+            return cached
+        payload = await self.requests.api_client.query_card(cache_key)
+        card_data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+        icon_url = str(card_data.get("icon") or "").strip()
+        if icon_url:
+            try:
+                await self.requests.api_client.get_icon(icon_url)
+            except Exception:
+                pass
+        _cache_put(_PLAYER_CARD_CACHE, cache_key, payload, ttl=PLAYER_CARD_CACHE_TTL, max_size=PLAYER_CARD_CACHE_MAX)
+        return payload
+
+    async def _fetch_player_risk_status(self, customer_token: str) -> Optional[RiskStatus]:
+        try:
+            return parse_risk_status(await self._fetch_cached_player_card(customer_token))
+        except Exception:
+            return None
+
+    async def _hydrate_match_detail_risk_statuses(
+        self,
+        payload: Dict[str, Any],
+        *,
+        known_risk_statuses: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Copy match detail and attach queryCard restrictions to rendered players."""
+
+        detail_root = copy.deepcopy(_extract_match_detail_data(payload))
+        players: List[Dict[str, Any]] = []
+
+        def collect_from(container: Any) -> None:
+            if not isinstance(container, dict):
+                return
+            for team_key in ("teammateList", "enemyList"):
+                for player in container.get(team_key, []) or []:
+                    if isinstance(player, dict):
+                        players.append(player)
+
+        collect_from(detail_root)
+        collect_from(detail_root.get("totalCount"))
+        for round_data in detail_root.get("roundCountList", []) or []:
+            collect_from(round_data)
+
+        players_by_token: Dict[str, List[Dict[str, Any]]] = {}
+        for player in players:
+            customer_token = str(player.get("customerToken") or player.get("customer_token") or "").strip()
+            if customer_token:
+                players_by_token.setdefault(customer_token, []).append(player)
+
+        normalized_known: Dict[str, Optional[RiskStatus]] = {}
+        for customer_token, value in (known_risk_statuses or {}).items():
+            token = str(customer_token or "").strip()
+            if token:
+                normalized_known[token] = parse_risk_status(value)
+
+        missing_tokens = [token for token in players_by_token if token not in normalized_known]
+        fetched = await asyncio.gather(
+            *(self._fetch_player_risk_status(token) for token in missing_tokens),
+            return_exceptions=True,
+        )
+        for token, result in zip(missing_tokens, fetched):
+            normalized_known[token] = result if isinstance(result, RiskStatus) else None
+
+        for token, token_players in players_by_token.items():
+            risk_status = normalized_known.get(token)
+            if risk_status is None:
+                continue
+            normalized = risk_status.to_dict()
+            for player in token_players:
+                player["riskStatus"] = dict(normalized)
+
+        return detail_root
+
+    async def _build_ai_analysis(
+        self,
+        *,
+        match_data: Dict[str, Any],
+        all_player_details: List[Dict[str, Any]],
+        target_id: str,
+    ) -> Dict[str, Any]:
+        summary_text = generate_match_summary_text(match_data, target_id)
+        detailed_text = generate_detailed_stats_text(all_player_details, target_id)
+        score_bundle = calculate_match_scores(match_data)
+        persona_prompt = str(getattr(app_config, "ANALYSIS_PERSONA_PROMPT", "") or "").strip()
+        if persona_prompt:
+            persona_prompt = persona_prompt.format(
+                target_id=target_id,
+                anti_pressure=score_bundle["anti_pressure"],
+                teamwork=score_bundle["teamwork"],
+                aggressiveness=score_bundle["aggressiveness"],
+                match_quality=score_bundle["match_quality"],
+            )
+
+        prompt = f"""
+{persona_prompt}
+【助攻判读补充规则】
+不要把“助攻低”或“没有助攻”机械地当成负面结论。对于坦克位和输出位，助攻不是通用核心指标。很多英雄的技能机制、收割定位、爆发击杀方式或单点作战方式，本来就不容易稳定获得助攻。除非该英雄本身明显依赖团队增益、控制、挂状态或持续参与混战，且同场其他数据也能证明其协同性偏低，否则禁止写出无意义的“零助攻/助攻少所以表现差”评价。
+
+【身份】
+请扮演一位资深的电竞数据分析师，根据提供的比赛数据，输出一份犀利、简明扼要的分析报告。
+
+【输出要求】
+1. 必须严格使用中文，只输出纯 JSON，不要 markdown，不要解释，不要前后缀。
+2. 分析必须专业、简明、直接，结论要清晰，不能硬夸，不能胡编。
+3. 所有判断都必须以给定数据为准，不得虚构不存在的对局细节。
+4. 如果 JSON 字符串内部需要双引号，请转义为 \\\"，避免输出非法 JSON。
+
+【任务】
+1. 客观给焦点玩家评分，只能填 S/A/B/C/D。
+2. 用一句话指出焦点玩家最大优点或最大问题。
+3. 只写一个最关键的胜负手。
+4. 必须明确点出真正的 MVP 或背锅位，不能强行偏袒焦点玩家。
+5. 必须严格比较三路：坦克位、输出位、辅助位。
+6. 要写出最突出的个人表现、关键数据差距，或者同英雄对位 Diff。
+7. `attribute_scores` 的数值必须原样保留，不允许改动。
+
+【输出 JSON 模板】
+{{
+  "player_id": "{target_id}",
+  "score": "S/A/B/C/D",
+  "general_summary": "一句话核心总结",
+  "key_to_win_loss": "决定胜负的唯一核心点",
+  "red_black_list": {{
+    "mvp_or_potg": "真正的 MVP 或背锅位及依据",
+    "role_comparison": [
+      "坦克位：[双方对比结论]",
+      "输出位：[双方对比结论]",
+      "辅助位：[双方对比结论]"
+    ],
+    "outstanding_performance": "最突出的个人表现、关键数据差距或同英雄对位 Diff"
+  }},
+  "summary": "一句话总结本场整体观感",
+  "attribute_scores": {{
+    "anti_pressure": {score_bundle["anti_pressure"]},
+    "teamwork": {score_bundle["teamwork"]},
+    "aggressiveness": {score_bundle["aggressiveness"]},
+    "match_quality": {score_bundle["match_quality"]}
+  }},
+  "evaluation": "基于四项属性分的针对性评价",
+  "extra": "100字以内的人格化鼓励/安慰/小结",
+  "carry_index_data": []
+}}
+
+【原始比赛数据如下】
+{summary_text}
+--------------------------------------------------
+{detailed_text}
+--------------------------------------------------
+""".strip()
+
+        base_url = str(getattr(app_config, "ANALYSIS_BASE_URL", "") or "").strip()
+        api_key = _sanitize_api_key(getattr(app_config, "ANALYSIS_API_KEY", ""))
+
+        if not base_url or not api_key:
+            return {"fallback_text": "AI锐评未配置 ANALYSIS_BASE_URL / ANALYSIS_API_KEY。"}
+
+        model = _analysis_model_for_base_url(base_url)
+        try:
+            # 等 AI 返回不占用 dashen 抓取槽位，受全局 LLM 并发槽约束。
+            async with LLM_SEMAPHORE:
+                raw = await self._call_openai_compatible(
+                    self._chat_completion_url(base_url),
+                    api_key,
+                    {
+                        "model": model,
+                        "temperature": 0.2,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+            parsed = _parse_analysis_json(_extract_llm_message_content(raw))
+            if parsed:
+                parsed["carry_index_data"] = build_carry_index_data(match_data)
+                return {
+                    "json": parsed,
+                    "footer_source": "AI锐评",
+                }
+            return {"fallback_text": f"AI锐评生成失败。错误：invalid json ({model})"}
+        except Exception as exc:
+            return {"fallback_text": f"AI锐评生成失败。错误：{type(exc).__name__}: {exc}"}
+
+    def _chat_completion_url(self, base_url: str) -> str:
+        base = str(base_url or "").rstrip("/")
+        if base.endswith("/chat/completions"):
+            return base
+        if base.endswith("/v1") or base.endswith("/openai"):
+            return f"{base}/chat/completions"
+        return f"{base}/chat/completions"
+
+    async def _call_openai_compatible(self, url: str, api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        proxy_url = get_analysis_proxy(url)
+        async with build_analysis_async_client(timeout=300, proxy_url=proxy_url) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.json()
+
+    def _match_result_text(self, match_data: Dict[str, Any]) -> str:
+        if match_data.get("matchRet") == 1:
+            return "胜利"
+        if match_data.get("matchRet") == 0:
+            return "平局"
+        return "失败"
+
+
+dashen_match_module = DashenMatchModule()

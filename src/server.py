@@ -1,0 +1,6017 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+from collections.abc import Awaitable, Callable
+import contextvars
+import locale
+import threading
+import time
+import traceback
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from typing import Any, Dict, Iterable, List, Optional, TypeVar
+
+logger = logging.getLogger("overstats.server")
+
+try:
+    from overstats.config import APIConfig
+    from overstats.src.client.apiclient import dashen_api_client, _upstream_acc_var, _UpstreamAcc
+    from overstats.src.db.match_detail_recorder import MatchDetailRecorder
+    from overstats.src.db.player_identity import PlayerIdentityRecorder
+    from overstats.src.db.request_metrics import (
+        RequestMetricsRecorder,
+        EndpointPerfRecorder,
+        normalize_request_metric_url,
+    )
+    from overstats.src.db.shiqu_llm import shiqu_llm_recorder
+    from overstats.src.db.match_stats import IDPoolDB
+    from overstats.src.modules.errors import ModuleError
+    from overstats.src.modules.bnet_search import bnet_search_module
+    from overstats.src.modules.blizzard_player_search import (
+        BlizzardPlayerSearchQuery,
+        blizzard_player_search_module,
+    )
+    from overstats.src.modules.blizzard_profile import BlizzardProfileQuery, blizzard_profile_module
+    from overstats.src.modules.dashen_profile import DashenProfileQuery, dashen_profile_module
+    from overstats.src.modules.dashen_hero_compare import DashenHeroCompareQuery, dashen_hero_compare_module
+    from overstats.src.modules.dashen_hero_treemap import (
+        DashenHeroTreemapQuery,
+        dashen_hero_treemap_module,
+        normalize_treemap_mode,
+    )
+    from overstats.src.modules.query_tool import start_query_tool_asset_warmup, load_query_tool
+    from overstats.src.modules.dashen_match import DashenMatchQuery, dashen_match_module
+    from overstats.src.modules.dashen_sameplay import DashenSameplayQuery, dashen_sameplay_module
+    from overstats.src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
+    from overstats.src.modules.dashen_team_overview import team_overview_module
+    from overstats.src.modules.dashen_team_overview.render import render_overview
+    from overstats.src.modules.dashen_quick_strength import DashenQuickStrengthQuery, dashen_quick_strength_module
+    from overstats.src.modules.dashen_competitive_strength import (
+        DashenCompetitiveStrengthQuery,
+        dashen_competitive_strength_module,
+    )
+    from overstats.src.modules.dashen_shiqu import (
+        ShiquQuery,
+        shiqu_module,
+    )
+    from overstats.src.modules.dashen_court import (
+        CourtQuery,
+        court_module,
+    )
+    from overstats.src.db.court_llm import court_llm_recorder
+    from overstats.src.db.shiqu_llm import shiqu_llm_recorder
+    from overstats.src.modules.llm_call_status import (
+        court_llm_status,
+        shiqu_llm_status,
+        start_llm_status_reporter,
+    )
+    from overstats.src.modules.dashen_rank_leaderboard import (
+        DashenRankLeaderboardQuery,
+        dashen_rank_leaderboard_module,
+    )
+    from overstats.src.modules.dashen_hero_leaderboard import (
+        DashenHeroLeaderboardQuery,
+        dashen_hero_leaderboard_module,
+    )
+    from overstats.src.modules.dashen_summary import DashenSummaryQuery, dashen_summary_module
+    from overstats.src.modules.ow_hero_perk import OWHeroPerkQuery, ow_hero_perk_module
+    from overstats.src.modules.ow_hero_wiki import ow_hero_wiki_module
+    from overstats.src.modules.ow_hero_wiki.render import render_hero_wiki_error
+    from overstats.src.modules.ow_hero_wiki.requests import OWHeroWikiQuery
+    from overstats.src.modules.ow_hero_pick_rate import OWHeroPickRateQuery, ow_hero_pick_rate_module
+    from overstats.src.modules.ow_esports import ow_esports_module
+    from overstats.src.modules.ow_guess import OWGuessQuery, ow_guess_module
+    from overstats.src.modules.ow_shop import ow_shop_module
+    from overstats.src.modules.ow_hero_leaderboard import OWHeroLeaderboardSyncService
+    from overstats.src.modules.patch_notes import patch_notes_module
+    from overstats.src.modules.player_identity_search import (
+        PlayerIdentitySearchQuery,
+        player_identity_search_module,
+    )
+    from overstats.src.modules.internal_rank_distribution import (
+        RankDistributionQuery,
+        internal_rank_distribution_module,
+    )
+    from overstats.src.modules.auto_route import auto_route_module
+    from overstats.src.http_server import resolve_http_ui_asset
+except ModuleNotFoundError:
+    from config import APIConfig
+    from src.client.apiclient import dashen_api_client, _upstream_acc_var, _UpstreamAcc
+    from src.db.match_detail_recorder import MatchDetailRecorder
+    from src.db.player_identity import PlayerIdentityRecorder
+    from src.db.request_metrics import (
+        RequestMetricsRecorder,
+        EndpointPerfRecorder,
+        normalize_request_metric_url,
+    )
+    from src.db.shiqu_llm import shiqu_llm_recorder
+    from src.db.match_stats import IDPoolDB
+    from src.modules.errors import ModuleError
+    from src.modules.bnet_search import bnet_search_module
+    from src.modules.blizzard_player_search import (
+        BlizzardPlayerSearchQuery,
+        blizzard_player_search_module,
+    )
+    from src.modules.blizzard_profile import BlizzardProfileQuery, blizzard_profile_module
+    from src.modules.dashen_profile import DashenProfileQuery, dashen_profile_module
+    from src.modules.dashen_hero_compare import DashenHeroCompareQuery, dashen_hero_compare_module
+    from src.modules.dashen_hero_treemap import (
+        DashenHeroTreemapQuery,
+        dashen_hero_treemap_module,
+        normalize_treemap_mode,
+    )
+    from src.modules.query_tool import start_query_tool_asset_warmup, load_query_tool
+    from src.modules.dashen_match import DashenMatchQuery, dashen_match_module
+    from src.modules.dashen_sameplay import DashenSameplayQuery, dashen_sameplay_module
+    from src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
+    from src.modules.dashen_team_overview import team_overview_module
+    from src.modules.dashen_team_overview.render import render_overview
+    from src.modules.dashen_quick_strength import DashenQuickStrengthQuery, dashen_quick_strength_module
+    from src.modules.dashen_competitive_strength import (
+        DashenCompetitiveStrengthQuery,
+        dashen_competitive_strength_module,
+    )
+    from src.modules.dashen_shiqu import (
+        ShiquQuery,
+        shiqu_module,
+    )
+    from src.modules.dashen_court import (
+        CourtQuery,
+        court_module,
+    )
+    from src.db.court_llm import court_llm_recorder
+    from src.db.shiqu_llm import shiqu_llm_recorder
+    from src.modules.llm_call_status import (
+        court_llm_status,
+        shiqu_llm_status,
+        start_llm_status_reporter,
+    )
+    from src.modules.dashen_rank_leaderboard import (
+        DashenRankLeaderboardQuery,
+        dashen_rank_leaderboard_module,
+    )
+    from src.modules.dashen_hero_leaderboard import (
+        DashenHeroLeaderboardQuery,
+        dashen_hero_leaderboard_module,
+    )
+    from src.modules.dashen_summary import DashenSummaryQuery, dashen_summary_module
+    from src.modules.ow_hero_perk import OWHeroPerkQuery, ow_hero_perk_module
+    from src.modules.ow_hero_wiki import ow_hero_wiki_module
+    from src.modules.ow_hero_wiki.render import render_hero_wiki_error
+    from src.modules.ow_hero_wiki.requests import OWHeroWikiQuery
+    from src.modules.ow_hero_pick_rate import OWHeroPickRateQuery, ow_hero_pick_rate_module
+    from src.modules.ow_esports import ow_esports_module
+    from src.modules.ow_guess import OWGuessQuery, ow_guess_module
+    from src.modules.ow_shop import ow_shop_module
+    from src.modules.ow_hero_leaderboard import OWHeroLeaderboardSyncService
+    from src.modules.patch_notes import patch_notes_module
+    from src.modules.player_identity_search import (
+        PlayerIdentitySearchQuery,
+        player_identity_search_module,
+    )
+    from src.modules.internal_rank_distribution import (
+        RankDistributionQuery,
+        internal_rank_distribution_module,
+    )
+    from src.modules.auto_route import auto_route_module
+    from src.http_server import resolve_http_ui_asset
+
+
+def _coerce_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _coerce_profile_render_mode(payload: Dict[str, object]) -> str:
+    if _coerce_bool(payload.get("competitive"), False):
+        return "competitive"
+    raw_mode = str(payload.get("mode") or payload.get("render_mode") or "").strip().lower()
+    if raw_mode in {"competitive", "comp", "ranked"}:
+        return "competitive"
+    return "quick"
+
+
+# 是区吗 / 电竞法庭 的分段参考数据库（同英雄「数据参考行」来源）。
+# 延迟创建并复用单例，避免每次请求都新建 sqlite 连接。
+_SHIQU_REF_DB: "Optional[IDPoolDB]" = None
+
+
+def _get_shiqu_ref_db() -> "Optional[IDPoolDB]":
+    global _SHIQU_REF_DB
+    if _SHIQU_REF_DB is None:
+        try:
+            _SHIQU_REF_DB = IDPoolDB()
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[shiqu] 参考数据库初始化失败，参考数据将跳过: {exc}")
+            _SHIQU_REF_DB = None
+    return _SHIQU_REF_DB
+
+
+def _coerce_optional_int(payload: Dict[str, object], *keys: str) -> Optional[int]:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value in (None, "", "auto", "AUTO", "Auto"):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ModuleError(
+                error="invalid_integer",
+                message=f"{key} must be an integer when provided.",
+                status_code=400,
+                details={key: value},
+            ) from exc
+    return None
+
+
+def _build_internal_rank_distribution_query(payload: Dict[str, object]) -> RankDistributionQuery:
+    raw_rows = payload.get("rows")
+    raw_mode_summary = payload.get("mode_summary", payload.get("modeSummary", {}))
+    return RankDistributionQuery(
+        season=payload.get("season", 0),
+        total_count=payload.get("total_count", payload.get("totalCount", 0)),
+        rows=raw_rows if isinstance(raw_rows, list) else [],
+        mode_summary=raw_mode_summary if isinstance(raw_mode_summary, dict) else {},
+    )
+
+
+def _is_success_status(status: HTTPStatus) -> bool:
+    return 200 <= int(status) < 300
+
+
+def _image_reply_from_binary(body: bytes, content_type: str) -> Dict[str, object]:
+    return {
+        "type": "image",
+        "media_type": str(content_type or "image/png"),
+        "base64": base64.b64encode(body).decode("ascii"),
+    }
+
+
+def _build_ow_hero_pick_rate_query(payload: Dict[str, object]) -> OWHeroPickRateQuery:
+    return OWHeroPickRateQuery(
+        view=str(payload.get("view") or "").strip(),
+        game_mode=str(payload.get("game_mode") or payload.get("gameMode") or "").strip(),
+        mmr=str(payload.get("mmr") or "").strip(),
+        hero=str(payload.get("hero") or "").strip(),
+        history_limit=payload.get("history_limit", payload.get("historyLimit")),
+    )
+
+
+def _build_ow_hero_perk_query(payload: Dict[str, object]) -> OWHeroPerkQuery:
+    return OWHeroPerkQuery(
+        hero=str(payload.get("hero") or "").strip(),
+    )
+
+
+def _build_dashen_hero_treemap_query(payload: Dict[str, object]) -> DashenHeroTreemapQuery:
+    try:
+        from overstats.src.modules.dashen_hero_treemap.mini_program import get_hero_module_mode
+    except ModuleNotFoundError:
+        from src.modules.dashen_hero_treemap.mini_program import get_hero_module_mode
+    raw_mode = str(payload.get("mode") or "").strip()
+    try:
+        mode = normalize_treemap_mode(raw_mode, allow_stadium=get_hero_module_mode() == 1)
+    except ValueError as exc:
+        raise ModuleError(
+            error="invalid_treemap_query",
+            message=str(exc),
+            status_code=400,
+            details={"mode": raw_mode},
+        ) from exc
+    return DashenHeroTreemapQuery(
+        bnet_id=str(payload.get("bnet_id") or payload.get("bnetId") or payload.get("bnetID") or payload.get("battle_tag") or payload.get("bnet_name") or "").strip(),
+        customer_token=str(payload.get("customer_token") or payload.get("customerToken") or "").strip(),
+        xcxtoken=str(payload.get("xcxtoken") or payload.get("xcxToken") or "").strip(),
+        season=_coerce_optional_int(payload, "season", "season_c"),
+        include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+        mode=mode,
+    )
+
+
+def _build_blizzard_profile_query(payload: Dict[str, object]) -> BlizzardProfileQuery:
+    return BlizzardProfileQuery(
+        player_id=str(
+            payload.get("player_id")
+            or payload.get("playerId")
+            or payload.get("name")
+            or payload.get("query")
+            or payload.get("target")
+            or ""
+        ).strip(),
+        blizzard_id=str(payload.get("blizzard_id") or payload.get("blizzardId") or "").strip(),
+        locale=str(payload.get("locale") or "").strip(),
+        mode=_coerce_profile_render_mode(payload),
+    )
+
+
+def _build_dashen_profile_query(payload: Dict[str, object]) -> DashenProfileQuery:
+    season_value = payload.get("season")
+    if season_value is None:
+        season_value = payload.get("season_c")
+    season = None
+    if season_value not in (None, "", 0, "0", "auto", "AUTO", "Auto"):
+        try:
+            season = int(season_value)
+        except (TypeError, ValueError) as exc:
+            raise ModuleError(
+                error="invalid_season",
+                message="season must be an integer when provided.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","season":22}',
+                details={"season": season_value},
+            ) from exc
+    return DashenProfileQuery(
+        customer_token=str(payload.get("customer_token") or payload.get("customerToken") or "").strip(),
+        bnet_id=str(payload.get("bnet_id") or payload.get("bnetId") or "").strip(),
+        season=season,
+        include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+    )
+
+
+def _build_ow_hero_wiki_query(payload: Dict[str, object]) -> OWHeroWikiQuery:
+    return OWHeroWikiQuery(
+        hero=str(payload.get("hero") or "").strip(),
+        question=str(payload.get("question") or "").strip(),
+    )
+
+
+def _build_ow_guess_query(payload: Dict[str, object]) -> OWGuessQuery:
+    raw_question_type = payload.get("question_type")
+    if raw_question_type is None:
+        raw_question_type = payload.get("questionType")
+    return OWGuessQuery(question_type=str(raw_question_type or "").strip())
+
+
+def _build_dashen_rank_leaderboard_query(payload: Dict[str, object]) -> DashenRankLeaderboardQuery:
+    return DashenRankLeaderboardQuery(
+        province=str(payload.get("province") or payload.get("region") or "").strip(),
+        role=str(payload.get("role") or "").strip(),
+    )
+
+
+def _build_dashen_hero_leaderboard_query(payload: Dict[str, object]) -> DashenHeroLeaderboardQuery:
+    return DashenHeroLeaderboardQuery(
+        province=str(payload.get("province") or payload.get("region") or "").strip(),
+        hero=str(payload.get("hero") or "").strip(),
+        mode=str(payload.get("mode") or "").strip(),
+    )
+
+
+def _build_dashen_sameplay_query(payload: Dict[str, object]) -> DashenSameplayQuery:
+    limit = _coerce_optional_int(payload, "limit")
+    if limit is None:
+        limit = 20
+    return DashenSameplayQuery(
+        player1_bnet_id=str(payload.get("player1_bnet_id") or payload.get("player1BnetId") or "").strip(),
+        player1_customer_token=str(payload.get("player1_customer_token") or payload.get("player1CustomerToken") or "").strip(),
+        player2_bnet_id=str(payload.get("player2_bnet_id") or payload.get("player2BnetId") or "").strip(),
+        player2_customer_token=str(payload.get("player2_customer_token") or payload.get("player2CustomerToken") or "").strip(),
+        include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+        limit=limit,
+    )
+
+
+def _validate_dashen_sameplay_query(query: DashenSameplayQuery) -> None:
+    if not (query.player1_bnet_id or query.player1_customer_token):
+        raise ModuleError(
+            error="missing_player1_target",
+            message="player1_bnet_id or player1_customer_token is required.",
+            status_code=400,
+            hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890"}',
+        )
+    if not (query.player2_bnet_id or query.player2_customer_token):
+        raise ModuleError(
+            error="missing_player2_target",
+            message="player2_bnet_id or player2_customer_token is required.",
+            status_code=400,
+            hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890"}',
+        )
+
+
+_T = TypeVar("_T")
+
+
+class DashenRequestQueue:
+    def __init__(
+        self,
+        max_concurrent_requests: int,
+        max_accepted_requests: Optional[int] = None,
+        *,
+        light_load_threshold: int = 2,
+    ) -> None:
+        self.max_concurrent_requests = max(1, int(max_concurrent_requests or 1))
+        accepted_limit = self.max_concurrent_requests if max_accepted_requests is None else int(max_accepted_requests)
+        self.max_accepted_requests = max(1, accepted_limit)
+        # 轻指令负载让行阈值：轻指令（所有普通队列请求）pending 达到该值时
+        #（大于等于，默认 2），标注 heavy=True 的请求在队列槽外等待，把槽位让给
+        # 轻指令，提升高峰期轻指令响应速度。正在抓取的重指令不受影响（跑完本次
+        # 抓取即暂停，后续请求才让行）。设为 0 可完全暂停 heavy 请求抓取（应急开关）。
+        # 注意：shiqu/court 已与其他指令一致（不使用 heavy），本机制目前无调用方，
+        # 作为队列能力保留，供将来确需让行的重指令使用。
+        self.light_load_threshold = max(0, int(light_load_threshold))
+        self._light_pending = 0
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._active_requests = 0
+        self._queued_requests = 0
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        return self._semaphore
+
+    def _pending_requests(self) -> int:
+        return self._active_requests + self._queued_requests
+
+    async def _yield_to_light_load(self, label: str) -> None:
+        """重指令让行：轻指令高峰期间在队列槽外轮询等待。
+
+        等待条件（满足其一即继续等）：
+        1. 轻指令 pending 达到 light_load_threshold（大于等于，默认 2）；
+        2. 队列 pending 已达准入上限（继续等而不是直接 429，让行期间轻指令优先消化）。
+        等待期间不占用队列槽、不计入 pending/active，因此既不会阻塞轻指令，
+        也不会把后续请求挤到 429；已进入抓取的重指令跑完本次即暂停后续让行；
+        LLM 阶段不走本队列，始终不受影响。
+        """
+        announced = False
+        while True:
+            light_pending = self._light_pending
+            pending_requests = self._pending_requests()
+            if (
+                light_pending < self.light_load_threshold
+                and pending_requests < self.max_accepted_requests
+            ):
+                return
+            if not announced:
+                announced = True
+                print(
+                    "[overstats] dashen heavy request yielding to light load "
+                    f"label={label} light_pending={light_pending} "
+                    f"threshold={self.light_load_threshold} "
+                    f"pending={pending_requests} max_accepted={self.max_accepted_requests}"
+                )
+            await asyncio.sleep(0.1)
+
+    async def run(
+        self,
+        label: str,
+        factory: Callable[[], Awaitable[_T]],
+        *,
+        heavy: bool = False,
+    ) -> _T:
+        # heavy 请求：先在队列外向轻指令让行
+        if heavy:
+            await self._yield_to_light_load(label)
+
+        pending_requests = self._pending_requests()
+        if pending_requests >= self.max_accepted_requests:
+            print(
+                "[overstats] dashen request rejected "
+                f"label={label} pending={pending_requests} active={self._active_requests} "
+                f"queued={self._queued_requests} light_pending={self._light_pending} "
+                f"max_accepted={self.max_accepted_requests}"
+            )
+            raise ModuleError(
+                error="too_many_requests",
+                message="Too many requests. Please retry later.",
+                status_code=429,
+                details={
+                    "label": label,
+                    "active_requests": self._active_requests,
+                    "queued_requests": self._queued_requests,
+                    "pending_requests": pending_requests,
+                    "light_pending_requests": self._light_pending,
+                    "max_accepted_requests": self.max_accepted_requests,
+                },
+            )
+
+        if not heavy:
+            self._light_pending += 1
+        try:
+            semaphore = self._get_semaphore()
+            self._queued_requests += 1
+            _q_t0 = time.monotonic()
+            try:
+                await semaphore.acquire()
+            finally:
+                self._queued_requests -= 1
+            _qw = int((time.monotonic() - _q_t0) * 1000)
+            _qw_acc = _queue_wait_acc_var.get()
+            if _qw_acc is not None:
+                _qw_acc.add(_qw)
+
+            self._active_requests += 1
+            if self._queued_requests > 0:
+                print(
+                    "[overstats] dashen request dequeued "
+                    f"label={label} active={self._active_requests} queued={self._queued_requests}"
+                )
+            _fetch_t0 = time.monotonic()
+            try:
+                result = await factory()
+            except BaseException:
+                raise
+            else:
+                # 抓取结束即渲染开始，这里打一行边界日志，便于定位渲染卡顿。
+                _fetch_t1 = time.monotonic()
+                _wall_end = time.time()
+                log_fetch_done(label, _wall_end - (_fetch_t1 - _fetch_t0), _wall_end, _qw)
+                return result
+            finally:
+                self._active_requests -= 1
+                semaphore.release()
+        finally:
+            if not heavy:
+                self._light_pending -= 1
+
+
+class OverstatsCoreService:
+    """Core request facade used by every downstream client."""
+
+    def __init__(
+        self,
+        dashen_max_concurrent_requests: int = 2,
+        dashen_max_accepted_requests: Optional[int] = None,
+        dashen_light_load_threshold: int = 2,
+    ) -> None:
+        self.dashen_request_queue = DashenRequestQueue(
+            dashen_max_concurrent_requests,
+            max_accepted_requests=dashen_max_accepted_requests,
+            light_load_threshold=dashen_light_load_threshold,
+        )
+
+    async def handle_internal_rank_distribution_image(self, payload: Dict[str, object]) -> bytes:
+        result = await internal_rank_distribution_module.query_rank_distribution(
+            _build_internal_rank_distribution_query(payload),
+            render=True,
+        )
+        if not result.image:
+            raise ModuleError(
+                error="render_failed",
+                message="Rank distribution image was not generated.",
+                status_code=500,
+            )
+        return result.image.content
+
+    async def handle_dashen_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
+        if _coerce_bool(payload.get("render"), False):
+            return await self._handle_dashen_profile_replies(payload)
+        return await self.dashen_request_queue.run(
+            "profile",
+            lambda: self._handle_dashen_profile(payload),
+        )
+
+    async def _handle_dashen_profile_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+        """JSON 端点 render=true：抓取占槽、渲染槽外，返回身份 meta + 图片 replies。"""
+        query = _build_dashen_profile_query(payload)
+        render_mode = _coerce_profile_render_mode(payload)
+        output = await self.dashen_request_queue.run(
+            "profile_render",
+            lambda: dashen_profile_module.fetch_profile(query, for_render=True, render_mode=render_mode),
+        )
+        image = await dashen_profile_module.render_profile(output, render_mode=render_mode)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen profile image was not generated.",
+                status_code=500,
+            )
+        card = output.bundle.profile_card.get("data") if isinstance(output.bundle.profile_card, dict) else None
+        card = card if isinstance(card, dict) else {}
+        resolved = output.resolved_bnet
+        identity = str(card.get("bnetId") or (resolved.bnet_id if resolved else "") or "").strip()
+        name = str(card.get("name") or (resolved.full_id if resolved else "") or identity)
+        return {"ok": True, "replies": [
+            {"type": "meta", "meta_type": "ds_profile_player", "data": {"bnet_id": identity, "name": name}},
+            {"type": "image", "base64": base64.b64encode(image.content).decode("ascii")},
+        ]}
+
+    async def handle_dashen_profile_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_dashen_profile_query(payload)
+        render_mode = _coerce_profile_render_mode(payload)
+
+        # 抓取阶段：占用 dashen 队列槽（含头像抓取）
+        output = await self.dashen_request_queue.run(
+            "profile_image",
+            lambda: dashen_profile_module.fetch_profile(query, for_render=True, render_mode=render_mode),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_profile_module.render_profile(output, render_mode=render_mode)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen profile image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_blizzard_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "blizzard_profile",
+            lambda: self._handle_blizzard_profile(payload),
+        )
+
+    async def handle_blizzard_profile_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_blizzard_profile_query(payload)
+        # 抓取阶段：占用 dashen 队列槽（含头像/英雄图标抓取）
+        output = await self.dashen_request_queue.run(
+            "blizzard_profile_image",
+            lambda: blizzard_profile_module.fetch_profile(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await blizzard_profile_module.render_profile(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Blizzard profile image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_career_personality(self, payload, *, render=False):
+        from .modules.career_personality import CareerPersonalityQuery, career_personality_module
+
+        if payload.get("season") not in (None, "", "total"):
+            raise ModuleError(error="unsupported_career_season", message="生涯人格仅支持累计数据，请省略 season。", status_code=400)
+        query = CareerPersonalityQuery(
+            player=str(payload.get("player") or payload.get("player1") or payload.get("bnetID")
+                       or payload.get("bnet_id") or payload.get("bnetId") or payload.get("battle_tag")
+                       or payload.get("bnet_name") or payload.get("target") or ""),
+            mode=str(payload.get("mode") or "quick"),
+            xcxtoken=str(payload.get("xcxtoken") or payload.get("xcxToken") or ""),
+        )
+
+        if not render:
+            async def run():
+                result = await career_personality_module.query_personality(query, render=False)
+                return result.to_dict()
+
+            return await self.dashen_request_queue.run("career_personality", run)
+
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
+            "career_personality",
+            lambda: career_personality_module.fetch_personality(query),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        result = await career_personality_module.render_personality(output)
+        return result.image.content
+
+    async def handle_career_compare(self, payload, *, render=False):
+        from .modules.career_compare import CareerCompareQuery, career_compare_module
+
+        if payload.get("season") not in (None, "", "total"):
+            raise ModuleError(error="unsupported_career_season", message="生涯对比仅支持累计数据，请省略 season。", status_code=400)
+        query = CareerCompareQuery(
+            player1=str(payload.get("player1") or ""),
+            player2=str(payload.get("player2") or ""),
+            hero=str(payload.get("hero") or ""),
+            mode=str(payload.get("mode") or "quick"),
+            xcxtoken=str(payload.get("xcxtoken") or payload.get("xcxToken") or ""),
+        )
+
+        if not render:
+            async def run():
+                result = await career_compare_module.query_compare(query, render=False)
+                return result.to_dict()
+
+            return await self.dashen_request_queue.run("career_compare", run)
+
+        # 抓取阶段：占用 dashen 队列槽（含图标预热）
+        output = await self.dashen_request_queue.run(
+            "career_compare",
+            lambda: career_compare_module.fetch_compare(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        result = await career_compare_module.render_compare(output)
+        return result.image.content
+
+    async def handle_dashen_hero_compare(self, payload, *, render=False):
+        try:
+            season=_coerce_optional_int(payload, "season", "season_c")
+            query=DashenHeroCompareQuery(player1=str(payload.get("player1") or ""),player2=str(payload.get("player2") or ""),hero=str(payload.get("hero") or ""),mode=str(payload.get("mode") or "quick"),season=season)
+        except (ValueError,TypeError) as exc:
+            raise ModuleError(error="invalid_compare_query",message=str(exc),status_code=400) from exc
+        if not render:
+            async def run():
+                result=await dashen_hero_compare_module.query_compare(query,render=False)
+                return result.to_dict()
+            return await self.dashen_request_queue.run("hero_compare",run)
+        # 抓取阶段：占用 dashen 队列槽（含图标预热）
+        output = await self.dashen_request_queue.run(
+            "hero_compare",
+            lambda: dashen_hero_compare_module.fetch_compare(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        result = await dashen_hero_compare_module.render_compare(output)
+        return result.image.content
+
+    async def handle_dashen_hero_compare_image(self, payload):
+        return await self.handle_dashen_hero_compare(payload,render=True)
+
+    async def handle_dashen_hero_treemap(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "hero_treemap",
+            lambda: self._handle_dashen_hero_treemap(payload),
+        )
+
+    async def handle_dashen_hero_treemap_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_dashen_hero_treemap_query(payload)
+        # 抓取阶段：占用 dashen 队列槽（含图标预热）
+        output = await self.dashen_request_queue.run(
+            "hero_treemap_image",
+            lambda: dashen_hero_treemap_module.fetch_treemap(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        result = await dashen_hero_treemap_module.render_treemap(output)
+        if not result.image:
+            raise ModuleError(
+                error="render_failed",
+                message="Hero treemap image was not generated.",
+                status_code=500,
+            )
+        return result.image.content
+
+    async def _handle_dashen_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_dashen_profile_query(payload)
+        include_previous_season = query.include_previous_season
+
+        result = await dashen_profile_module.query_profile(query)
+        resolved = result.resolved_bnet
+        bundle = result.bundle
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": resolved.query,
+                "full_id": resolved.full_id,
+                "bnet_id": resolved.bnet_id,
+                "has_customer_token": bool(resolved.customer_token),
+            } if resolved else None,
+            "season": {
+                "logical": bundle.logical_season,
+                "request": bundle.request_season,
+                "include_previous_season": include_previous_season,
+            },
+            "profile_card": bundle.profile_card,
+            "sport": bundle.sport,
+            "leisure": bundle.leisure,
+        }
+
+    async def _handle_dashen_hero_treemap(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_dashen_hero_treemap_query(payload)
+        result = await dashen_hero_treemap_module.query_treemap(query, render=False)
+        return result.to_dict()
+
+    def handle_query(
+        self,
+        route: str,
+        text: str,
+        stream: bool,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        replies: List[Dict[str, object]] = [
+            {
+                "type": "meta",
+                "data": {
+                    "route": route,
+                    "stream": stream,
+                },
+            },
+            {
+                "type": "text",
+                "data": f"overstats core received: {text or route}",
+            },
+        ]
+        return {
+            "ok": True,
+            "route": route,
+            "text": text,
+            "stream": stream,
+            "extra": extra or {},
+            "replies": replies,
+        }
+
+    async def handle_player_identity_search(self, payload: Dict[str, object]) -> Dict[str, object]:
+        lookup_bnet_id = str(
+            payload.get("bnet_id")
+            or payload.get("bnetId")
+            or payload.get("query")
+            or payload.get("target")
+            or ""
+        ).strip()
+        limit = _coerce_optional_int(payload, "limit")
+        if limit is None:
+            limit = 10
+        exact_only_value = payload.get("exact_only")
+        if exact_only_value is None:
+            exact_only_value = payload.get("exactOnly")
+        exact_only = _coerce_bool(exact_only_value, False)
+        result = await player_identity_search_module.search(
+            PlayerIdentitySearchQuery(
+                bnet_id=lookup_bnet_id,
+                limit=limit,
+                exact_only=exact_only,
+            )
+        )
+        matches = [item.to_dict() for item in result.matches]
+        return {
+            "ok": True,
+            "query": {
+                "bnet_id": result.query.bnet_id,
+                "limit": result.query.limit,
+                "exact_only": result.query.exact_only,
+            },
+            "count": len(matches),
+            "candidates": [str(item["battletag"]) for item in matches if item.get("battletag")],
+            "matches": matches,
+        }
+
+    async def handle_blizzard_player_search(self, payload: Dict[str, object]) -> Dict[str, object]:
+        lookup_name = str(
+            payload.get("name")
+            or payload.get("player_id")
+            or payload.get("playerId")
+            or payload.get("query")
+            or payload.get("target")
+            or ""
+        ).strip()
+        limit = _coerce_optional_int(payload, "limit")
+        if limit is None:
+            limit = 20
+        offset = _coerce_optional_int(payload, "offset")
+        if offset is None:
+            offset = 0
+        query = BlizzardPlayerSearchQuery(
+            name=lookup_name,
+            locale=str(payload.get("locale") or "").strip(),
+            order_by=str(payload.get("order_by") or payload.get("orderBy") or "").strip(),
+            offset=offset,
+            limit=limit,
+            blizzard_id=str(payload.get("blizzard_id") or payload.get("blizzardId") or "").strip(),
+        )
+        result = await blizzard_player_search_module.search(query)
+        entries = [item.to_dict() for item in result.results]
+        return {
+            "ok": True,
+            "query": {
+                "name": result.query.name,
+                "locale": result.query.locale,
+                "order_by": result.query.order_by,
+                "offset": result.query.offset,
+                "limit": result.query.limit,
+                "blizzard_id": result.query.blizzard_id,
+            },
+            "total": result.total,
+            "count": len(entries),
+            "results": entries,
+            "resolved": result.resolved.to_dict() if result.resolved else None,
+        }
+
+    async def _handle_blizzard_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_blizzard_profile_query(payload)
+        result = await blizzard_profile_module.query_profile(query, render=False)
+        return {
+            "ok": True,
+            "query": {
+                "player_id": result.query.player_id,
+                "blizzard_id": result.query.blizzard_id,
+                "locale": result.query.locale,
+                "mode": result.query.mode,
+            },
+            "resolved": {
+                "player_id": result.resolved_player_id,
+                "battletag": result.battletag,
+                "battlenum": result.battlenum,
+                "display_name": result.parsed.summary.display_name,
+                "blizzard_id": result.resolved_blizzard_id,
+                "career_url": result.career_url,
+            },
+            "search": {
+                "count": len(result.search_results),
+                "results": [item.to_dict() for item in result.search_results],
+                "resolved": result.resolved_entry.to_dict() if result.resolved_entry else None,
+            } if (result.search_results or result.resolved_entry) else None,
+            "profile": result.parsed.to_dict(),
+        }
+
+    async def handle_auto_route(self, payload: Dict[str, object]) -> Dict[str, object]:
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise ModuleError(
+                error="missing_text",
+                message="text is required.",
+                status_code=400,
+            )
+
+        selection = await auto_route_module.select(text)
+        dispatch_map = {
+            "/api/v2/dashen-profile/image": lambda: self.handle_dashen_profile_image(selection.payload),
+            "/api/v2/dashen-match/replies": lambda: self.handle_dashen_match_replies(selection.payload),
+            "/api/v2/dashen-match/detail/replies": lambda: self.handle_dashen_match_detail_replies(selection.payload),
+            "/api/v2/dashen-sameplay/replies": lambda: self.handle_dashen_sameplay_replies(selection.payload),
+            "/api/v2/dashen-sameplay/detail/replies": lambda: self.handle_dashen_sameplay_detail_replies(selection.payload),
+            "/api/v2/dashen-summary/today/image": lambda: self.handle_dashen_summary_image(selection.payload, scope="today"),
+            "/api/v2/dashen-summary/yesterday/image": lambda: self.handle_dashen_summary_image(selection.payload, scope="yesterday"),
+            "/api/v2/dashen-summary/week/image": lambda: self.handle_dashen_summary_image(selection.payload, scope="week"),
+            "/api/v2/dashen-team-overview/image": lambda: self.handle_dashen_team_overview_image(selection.payload),
+            "/api/v2/dashen-rank-history/image": lambda: self.handle_dashen_rank_history_image(selection.payload),
+            "/api/v2/dashen-quick-strength/image": lambda: self.handle_dashen_quick_strength_image(selection.payload),
+            "/api/v2/dashen-competitive-strength/image": lambda: self.handle_dashen_competitive_strength_image(selection.payload),
+            "/api/v2/dashen-hero-compare/image": lambda: self.handle_dashen_hero_compare_image(selection.payload),
+            "/api/v2/career-compare/image": lambda: self.handle_career_compare(
+                {**selection.payload, "xcxtoken": payload.get("xcxtoken") or payload.get("xcxToken") or ""}, render=True),
+            "/api/v2/dashen-hero-treemap/image": lambda: self.handle_dashen_hero_treemap_image(selection.payload),
+            "/api/v2/ow-hero-perk/image": lambda: self.handle_ow_hero_perk_image(selection.payload),
+            "/api/v2/ow_hero_wiki/image": lambda: self.handle_ow_hero_wiki_image(selection.payload),
+            "/api/v2/ow-hero-pick-rate/image": lambda: self.handle_ow_hero_pick_rate_image(selection.payload),
+            "/api/v2/ow-esports/image": lambda: self.handle_ow_esports_image(selection.payload),
+            "/api/v2/ow-shop/image": lambda: self.handle_ow_shop_image(selection.payload),
+            "/api/v2/patch-notes/image": lambda: self.handle_patch_notes_image(selection.payload),
+            "/api/v2/dashen-profile": lambda: self.handle_dashen_profile(selection.payload),
+            "/api/v2/dashen-match": lambda: self.handle_dashen_match(selection.payload),
+            "/api/v2/dashen-match/detail": lambda: self.handle_dashen_match_detail(selection.payload),
+            "/api/v2/dashen-sameplay": lambda: self.handle_dashen_sameplay(selection.payload),
+            "/api/v2/dashen-sameplay/detail": lambda: self.handle_dashen_sameplay_detail(selection.payload),
+            "/api/v2/dashen-summary/today": lambda: self.handle_dashen_summary(selection.payload, scope="today"),
+            "/api/v2/dashen-summary/yesterday": lambda: self.handle_dashen_summary(selection.payload, scope="yesterday"),
+            "/api/v2/dashen-summary/week": lambda: self.handle_dashen_summary(selection.payload, scope="week"),
+            "/api/v2/dashen-team-overview": lambda: self.handle_dashen_team_overview(selection.payload),
+            "/api/v2/dashen-rank-history": lambda: self.handle_dashen_rank_history(selection.payload),
+            "/api/v2/dashen-quick-strength": lambda: self.handle_dashen_quick_strength(selection.payload),
+            "/api/v2/dashen-competitive-strength": lambda: self.handle_dashen_competitive_strength(selection.payload),
+            "/api/v2/dashen-shiqu": lambda: self.handle_shiqu(selection.payload),
+            "/api/v2/dashen-shiqu/image": lambda: self.handle_shiqu_image(selection.payload),
+            "/api/v2/dashen-court": lambda: self.handle_court(selection.payload),
+            "/api/v2/dashen-court/image": lambda: self.handle_court_image(selection.payload),
+            "/api/v2/dashen-hero-compare": lambda: self.handle_dashen_hero_compare(selection.payload),
+            "/api/v2/dashen-hero-treemap": lambda: self.handle_dashen_hero_treemap(selection.payload),
+            "/api/v2/ow-hero-perk": lambda: self.handle_ow_hero_perk(selection.payload),
+            "/api/v2/ow_hero_wiki": lambda: self.handle_ow_hero_wiki(selection.payload),
+            "/api/v2/ow-hero-pick-rate": lambda: self.handle_ow_hero_pick_rate(selection.payload),
+            "/api/v2/ow-esports": lambda: self.handle_ow_esports(selection.payload),
+            "/api/v2/ow-shop": lambda: self.handle_ow_shop(selection.payload),
+            "/api/v2/patch-notes": lambda: self.handle_patch_notes(selection.payload),
+        }
+
+        executor = dispatch_map.get(selection.endpoint)
+        if executor is None:
+            raise ModuleError(
+                error="auto_route_invalid_tool",
+                message=f"Unsupported auto-route endpoint: {selection.endpoint}",
+                status_code=502,
+                details={"tool_name": selection.tool_name, "endpoint": selection.endpoint},
+            )
+
+        execution_payload = await executor()
+        if selection.endpoint_mode == "replies":
+            replies_payload = execution_payload if isinstance(execution_payload, dict) else {}
+            return {
+                "ok": True,
+                "selection": selection.to_dict(),
+                "execution": {
+                    "result_kind": "replies",
+                    "payload": replies_payload,
+                    "replies": list(replies_payload.get("replies") or []),
+                },
+            }
+
+        if selection.endpoint_mode == "image":
+            image_body = execution_payload
+            content_type = "image/png"
+            if isinstance(execution_payload, tuple):
+                image_body, content_type = execution_payload
+            return {
+                "ok": True,
+                "selection": selection.to_dict(),
+                "execution": {
+                    "result_kind": "replies",
+                    "payload": None,
+                    "replies": [_image_reply_from_binary(image_body, content_type)],
+                },
+            }
+
+        return {
+            "ok": True,
+            "selection": selection.to_dict(),
+            "execution": {
+                "result_kind": "json",
+                "payload": execution_payload,
+                "replies": None,
+            },
+        }
+
+    def iter_query_events(
+        self,
+        route: str,
+        text: str,
+        stream: bool,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> Iterable[Dict[str, object]]:
+        result = self.handle_query(route=route, text=text, stream=stream, extra=extra)
+        yield {
+            "type": "meta",
+            "data": {
+                "route": result["route"],
+                "stream": result["stream"],
+            },
+        }
+        for reply in result["replies"]:
+            if reply.get("type") == "meta":
+                continue
+            yield reply
+        yield {
+            "type": "done",
+            "data": {
+                "ok": True,
+            },
+        }
+
+    async def handle_ow_shop(self, payload: Dict[str, object]) -> Dict[str, object]:
+        result = await ow_shop_module.query_shop(render=False)
+        return result.to_dict()
+
+    async def handle_ow_shop_image(self, payload: Dict[str, object]) -> tuple[bytes, str]:
+        result = await ow_shop_module.query_shop(render=True)
+        if not result.image:
+            raise ModuleError(
+                error="render_failed",
+                message="OW shop image was not generated.",
+                status_code=500,
+            )
+        return result.image.content, result.image.media_type
+
+    async def handle_ow_esports(self, payload: Dict[str, object]) -> Dict[str, object]:
+        result = await ow_esports_module.query_ow_esports(render=False, region=payload.get("region", "china"))
+        return result.to_dict()
+
+    async def handle_ow_esports_image(self, payload: Dict[str, object]) -> bytes:
+        result = await ow_esports_module.query_ow_esports(render=True, region=payload.get("region", "china"))
+        if not result.image:
+            raise ModuleError(
+                error="render_failed",
+                message="OW esports image was not generated.",
+                status_code=500,
+            )
+        return result.image.content
+
+    async def handle_ow_guess_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_ow_guess_query(payload)
+        result = await ow_guess_module.query_guess_replies(query)
+        return result.to_dict()
+
+    @staticmethod
+    def _patch_reader_args(payload):
+        return {
+            "patch_kind": payload.get("patch_kind", payload.get("kind")),
+            "view": payload.get("view") or "auto", "section": payload.get("section") or "",
+            "hero": payload.get("hero") or "", "page": payload.get("page", 1),
+            "patch_id": payload.get("patch_id") or "",
+        }
+
+    async def handle_patch_notes(self, payload: Dict[str, object]) -> Dict[str, object]:
+        result = await patch_notes_module.query_patch_notes(**self._patch_reader_args(payload), render=False)
+        return result.to_dict()
+
+    async def handle_patch_notes_image(self, payload: Dict[str, object]) -> bytes:
+        result = await patch_notes_module.query_patch_notes(**self._patch_reader_args(payload), render=True)
+        if not result.image:
+            raise ModuleError(error="render_failed", message="Patch notes image was not generated.", status_code=500)
+        return result.image.content
+
+    async def handle_patch_notes_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+        result = await patch_notes_module.query_patch_notes(**self._patch_reader_args(payload), render=True)
+        output = result.to_dict()
+        meta = result.reader
+        message = f"{'更新总览' if meta['view'] == 'overview' else '补丁正文'} · 第 {meta['page']}/{meta['page_count']} 页"
+        if meta['view'] == 'overview':
+            message += "\n精简改动图：不按条数省略，省去开发者评价。绿色增强、红色削弱、黄色调整；完整上下文见原文。"
+        message += "\n原文：" + str(meta.get('source_url') or '')
+        output["replies"] = [{"type": "text", "data": message}]
+        if result.image:
+            output["replies"].append({"type": "image", "media_type": "image/png",
+                "base64": base64.b64encode(result.image.content).decode("ascii")})
+        return output
+
+    async def handle_ow_hero_perk(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_ow_hero_perk_query(payload)
+        result = await ow_hero_perk_module.query_perk(query, render=False)
+        return result.to_dict()
+
+    async def handle_ow_hero_perk_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_ow_hero_perk_query(payload)
+        result = await ow_hero_perk_module.query_perk(query, render=True)
+        if not result.image:
+            raise ModuleError(
+                error="render_failed",
+                message="Hero perk image was not generated.",
+                status_code=500,
+            )
+        return result.image.content
+
+    async def handle_ow_hero_wiki(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_ow_hero_wiki_query(payload)
+        result = await ow_hero_wiki_module.query_hero(query, render=False)
+        return result.to_dict()
+
+    async def handle_ow_hero_wiki_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_ow_hero_wiki_query(payload)
+        try:
+            result = await ow_hero_wiki_module.query_hero(query, render=True)
+        except ModuleError as exc:
+            return render_hero_wiki_error("英雄维基不可用", exc.message).content
+        if not result.image:
+            raise ModuleError(
+                error="render_failed",
+                message="Hero wiki image was not generated.",
+                status_code=500,
+            )
+        return result.image.content
+
+    async def handle_ow_hero_pick_rate(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_ow_hero_pick_rate_query(payload)
+        result = await ow_hero_pick_rate_module.query_pick_rate(query, render=False)
+        return result.to_dict()
+
+    async def handle_ow_hero_pick_rate_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_ow_hero_pick_rate_query(payload)
+        result = await ow_hero_pick_rate_module.query_pick_rate(query, render=True)
+        if not result.image:
+            raise ModuleError(
+                error="render_failed",
+                message="Hero pick-rate image was not generated.",
+                status_code=500,
+            )
+        return result.image.content
+
+    async def handle_dashen_rank_leaderboard(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "rank_leaderboard",
+            lambda: self._handle_dashen_rank_leaderboard(payload),
+        )
+
+    async def _handle_dashen_rank_leaderboard(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_dashen_rank_leaderboard_query(payload)
+        result = await dashen_rank_leaderboard_module.query_rank_leaderboard(query, render=False)
+        return result.to_dict()
+
+    async def handle_dashen_rank_leaderboard_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_dashen_rank_leaderboard_query(payload)
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
+            "rank_leaderboard_image",
+            lambda: dashen_rank_leaderboard_module.fetch_rank_leaderboard(query),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_rank_leaderboard_module.render_rank_leaderboard(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen rank leaderboard image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_dashen_hero_leaderboard(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "hero_leaderboard",
+            lambda: self._handle_dashen_hero_leaderboard(payload),
+        )
+
+    async def _handle_dashen_hero_leaderboard(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_dashen_hero_leaderboard_query(payload)
+        result = await dashen_hero_leaderboard_module.query_hero_leaderboard(query, render=False)
+        return result.to_dict()
+
+    async def handle_dashen_hero_leaderboard_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_dashen_hero_leaderboard_query(payload)
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
+            "hero_leaderboard_image",
+            lambda: dashen_hero_leaderboard_module.fetch_hero_leaderboard(query),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_hero_leaderboard_module.render_hero_leaderboard(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen hero leaderboard image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_dashen_match(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "match_list",
+            lambda: self._handle_dashen_match(payload),
+        )
+
+    async def _handle_dashen_match(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        if not bnet_id and not customer_token:
+            return {
+                "ok": False,
+                "error": "missing_target",
+                "message": "bnet_id or customer_token is required",
+            }
+
+        target_count = int(payload.get("target_count") or payload.get("limit") or 20)
+        include_fight = _coerce_bool(payload.get("include_fight"), True)
+        include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
+        render = _coerce_bool(payload.get("render"), False)
+
+        # JSON 端点只取数据（render 仅控制是否附带抓取 risk_status，不出图）
+        result = await dashen_match_module.fetch_match_list(
+            DashenMatchQuery(
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
+                customer_token=customer_token,
+                bnet_id=bnet_id,
+                target_count=target_count,
+                include_fight=include_fight,
+                include_previous_season=include_previous_season,
+            ),
+            for_render=render,
+        )
+        resolved = result.resolved_bnet
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": resolved.query,
+                "full_id": resolved.full_id,
+                "bnet_id": resolved.bnet_id,
+                "has_customer_token": bool(resolved.customer_token),
+            } if resolved else None,
+            "count": len(result.matches),
+            "matches": result.matches,
+        }
+
+    async def handle_dashen_match_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","limit":20}',
+            )
+
+        query = DashenMatchQuery(
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            target_count=int(payload.get("target_count") or payload.get("limit") or 20),
+            include_fight=_coerce_bool(payload.get("include_fight"), True),
+            include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+        )
+        # 抓取阶段：占用 dashen 队列槽（含 risk_status）
+        output = await self.dashen_request_queue.run(
+            "match_replies",
+            lambda: dashen_match_module.fetch_match_list(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        result = await dashen_match_module.render_match_list_replies(output)
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": result.resolved_bnet.query,
+                "full_id": result.resolved_bnet.full_id,
+                "bnet_id": result.resolved_bnet.bnet_id,
+                "has_customer_token": bool(result.resolved_bnet.customer_token),
+            } if result.resolved_bnet else None,
+            "replies": result.replies,
+        }
+
+    async def handle_dashen_match_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","limit":20}',
+            )
+
+        target_count = int(payload.get("target_count") or payload.get("limit") or 20)
+        include_fight = _coerce_bool(payload.get("include_fight"), True)
+        include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
+        query = DashenMatchQuery(
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            target_count=target_count,
+            include_fight=include_fight,
+            include_previous_season=include_previous_season,
+        )
+        # 抓取阶段：占用 dashen 队列槽（含 risk_status）
+        output = await self.dashen_request_queue.run(
+            "match_image",
+            lambda: dashen_match_module.fetch_match_list(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_match_module.render_match_list(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen match image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_dashen_sameplay(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "sameplay_list",
+            lambda: self._handle_dashen_sameplay(payload),
+        )
+
+    async def handle_dashen_sameplay_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
+            "sameplay_replies",
+            lambda: dashen_sameplay_module.fetch_sameplay_list(query),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        result = await dashen_sameplay_module.render_sameplay_list_replies(output)
+        return {
+            "ok": True,
+            "players": {
+                "resolved": {
+                    "player1": result.player1.to_dict(),
+                    "player2": result.player2.to_dict(),
+                }
+            },
+            "customer_tokens": {
+                "player1": result.player1.customer_token,
+                "player2": result.player2.customer_token,
+            },
+            "summary": dict(result.summary),
+            "replies": result.replies,
+        }
+
+    async def handle_dashen_sameplay_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
+            "sameplay_image",
+            lambda: dashen_sameplay_module.fetch_sameplay_list(query),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_sameplay_module.render_sameplay_list(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen sameplay image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_dashen_sameplay_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "sameplay_detail",
+            lambda: self._handle_dashen_sameplay_detail(payload),
+        )
+
+    async def handle_dashen_sameplay_detail_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        index_value = _coerce_optional_int(payload, "index", "idx")
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        if not match_id and index_value is None:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="index or match_id is required for sameplay detail.",
+                status_code=400,
+                hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890","index":0}',
+            )
+        show_all_heroes = _coerce_bool(
+            payload.get("show_all_heroes", payload.get("show_all", payload.get("all_heroes"))),
+            False,
+        )
+        analyze = _coerce_bool(payload.get("analyze"), False)
+        if analyze:
+            show_all_heroes = True
+        # 抓取阶段：占用 dashen 队列槽（含全员详细数据）
+        fetched = await self.dashen_request_queue.run(
+            "sameplay_detail_replies",
+            lambda: dashen_sameplay_module.fetch_sameplay_detail(
+                query,
+                index=index_value,
+                match_id=match_id,
+                show_all_heroes=show_all_heroes,
+                analyze=analyze,
+                for_render=True,
+            ),
+        )
+        # 渲染/AI 阶段：槽外执行，渲染与 AI 等待均不占用抓取槽位
+        result = await dashen_sameplay_module.render_sameplay_detail_replies(fetched)
+        return {
+            "ok": True,
+            "players": {
+                "resolved": {
+                    "player1": result.player1.to_dict(),
+                    "player2": result.player2.to_dict(),
+                }
+            },
+            "customer_tokens": {
+                "player1": result.player1.customer_token,
+                "player2": result.player2.customer_token,
+            },
+            "summary": dict(result.summary),
+            "match_id": result.match_id,
+            "match_kind": result.match_kind,
+            "replies": result.replies,
+        }
+
+    async def handle_dashen_sameplay_detail_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        index_value = _coerce_optional_int(payload, "index", "idx")
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        if not match_id and index_value is None:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="index or match_id is required for sameplay detail image.",
+                status_code=400,
+                hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890","index":0}',
+            )
+        # 抓取阶段：占用 dashen 队列槽
+        fetched = await self.dashen_request_queue.run(
+            "sameplay_detail_image",
+            lambda: dashen_sameplay_module.fetch_sameplay_detail(
+                query,
+                index=index_value,
+                match_id=match_id,
+                for_render=True,
+            ),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        result = await dashen_sameplay_module.render_sameplay_detail(fetched)
+        if not result.main_image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen sameplay detail image was not generated.",
+                status_code=500,
+            )
+        return result.main_image.content
+
+    async def _handle_dashen_sameplay(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        result = await dashen_sameplay_module.query_sameplay_list(query, render=False)
+        return {
+            "ok": True,
+            "players": {
+                "resolved": {
+                    "player1": result.player1.to_dict(),
+                    "player2": result.player2.to_dict(),
+                }
+            },
+            "customer_tokens": {
+                "player1": result.player1.customer_token,
+                "player2": result.player2.customer_token,
+            },
+            "summary": dict(result.summary),
+            "matches": result.matches,
+        }
+
+    async def _handle_dashen_sameplay_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        index_value = _coerce_optional_int(payload, "index", "idx")
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        if not match_id and index_value is None:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="index or match_id is required for sameplay detail.",
+                status_code=400,
+                hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890","index":0}',
+            )
+        result = await dashen_sameplay_module.query_sameplay_detail(
+            query,
+            index=index_value,
+            match_id=match_id,
+            show_all_heroes=_coerce_bool(payload.get("show_all_heroes", payload.get("show_all")), False),
+            analyze=_coerce_bool(payload.get("analyze"), False),
+            render=False,
+        )
+        return {
+            "ok": True,
+            "players": {
+                "resolved": {
+                    "player1": result.player1.to_dict(),
+                    "player2": result.player2.to_dict(),
+                }
+            },
+            "customer_tokens": {
+                "player1": result.player1.customer_token,
+                "player2": result.player2.customer_token,
+            },
+            "summary": dict(result.summary),
+            "match_id": result.match_id,
+            "match_kind": result.match_kind,
+            "main_detail_source_player": result.main_detail_source_player,
+            "source_match": result.source_match,
+            "detail": result.detail,
+            "player_details": [
+                {
+                    "player": item.player.to_dict(),
+                    "available": item.available,
+                    "detail": item.detail_payload,
+                    "note": item.note,
+                }
+                for item in result.player_details
+            ],
+            "notes": list(result.notes),
+        }
+
+    async def handle_dashen_match_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "match_detail",
+            lambda: self._handle_dashen_match_detail(payload),
+        )
+
+    async def _handle_dashen_match_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        index_value = payload.get("index")
+        if index_value is None:
+            index_value = payload.get("idx")
+
+        if match_id and not customer_token:
+            raise ModuleError(
+                error="missing_customer_token",
+                message="customer_token is required when querying detail by match_id directly.",
+                status_code=400,
+                hint='Use {"bnet_id":"Player#12345","index":0} or provide customer_token with match_id.',
+            )
+        if not match_id and index_value is None:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="index or match_id is required for match detail.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","index":0}',
+            )
+
+        if match_id:
+            result = await dashen_match_module.query_match_detail(
+                customer_token,
+                match_id,
+                render=False,
+            )
+        else:
+            if not bnet_id and not customer_token:
+                raise ModuleError(
+                    error="missing_target",
+                    message="Missing query target: bnet_id or customer_token is required.",
+                    status_code=400,
+                    hint='Example: {"bnet_id":"Player#12345","index":0}',
+                )
+            target_count = int(payload.get("target_count") or payload.get("limit") or 20)
+            include_fight = _coerce_bool(payload.get("include_fight"), True)
+            include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
+            result = await dashen_match_module.query_match_detail_by_index(
+                DashenMatchQuery(
+                    filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
+                    customer_token=customer_token,
+                    bnet_id=bnet_id,
+                    target_count=target_count,
+                    include_fight=include_fight,
+                    include_previous_season=include_previous_season,
+                ),
+                int(index_value),
+                render=False,
+            )
+
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": result.resolved_bnet.query,
+                "full_id": result.resolved_bnet.full_id,
+                "bnet_id": result.resolved_bnet.bnet_id,
+                "has_customer_token": bool(result.resolved_bnet.customer_token),
+            } if result.resolved_bnet else None,
+            "match_id": result.detail.match_id,
+            "match_kind": result.detail.match_kind,
+            "source_match": result.detail.source_match,
+            "detail": result.detail.payload,
+        }
+
+    async def handle_dashen_match_detail_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        index_value = payload.get("index")
+        if index_value is None:
+            index_value = payload.get("idx")
+
+        show_all_heroes = _coerce_bool(
+            payload.get("show_all_heroes", payload.get("show_all", payload.get("all_heroes"))),
+            False,
+        )
+        analyze = _coerce_bool(payload.get("analyze"), False)
+        if analyze:
+            show_all_heroes = True
+
+        if match_id and not customer_token:
+            raise ModuleError(
+                error="missing_customer_token",
+                message="customer_token is required when querying detail by match_id directly.",
+                status_code=400,
+                hint='Use {"bnet_id":"Player#12345","index":0} or provide customer_token with match_id.',
+            )
+        if not match_id and index_value is None:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="index or match_id is required for match detail.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","index":0}',
+            )
+
+        query = None
+        if not match_id:
+            if not bnet_id and not customer_token:
+                raise ModuleError(
+                    error="missing_target",
+                    message="Missing query target: bnet_id or customer_token is required.",
+                    status_code=400,
+                    hint='Example: {"bnet_id":"Player#12345","index":0}',
+                )
+            query = DashenMatchQuery(
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
+                customer_token=customer_token,
+                bnet_id=bnet_id,
+                target_count=int(payload.get("target_count") or payload.get("limit") or 20),
+                include_fight=_coerce_bool(payload.get("include_fight"), True),
+                include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+            )
+        elif bnet_id:
+            query = DashenMatchQuery(customer_token=customer_token, bnet_id=bnet_id)
+
+        # 抓取阶段：占用 dashen 队列槽（详情 + risk 补充 + 全员详细数据）
+        fetched = await self.dashen_request_queue.run(
+            "match_detail_replies",
+            lambda: dashen_match_module.fetch_match_detail_replies(
+                query=query,
+                customer_token=customer_token,
+                match_id=match_id,
+                index=int(index_value) if index_value is not None else None,
+                show_all_heroes=show_all_heroes,
+                analyze=analyze,
+            ),
+        )
+        # 渲染/AI 阶段：槽外执行，渲染与 AI 等待均不占用抓取槽位
+        result = await dashen_match_module.render_match_detail_replies(fetched)
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": result.resolved_bnet.query,
+                "full_id": result.resolved_bnet.full_id,
+                "bnet_id": result.resolved_bnet.bnet_id,
+                "has_customer_token": bool(result.resolved_bnet.customer_token),
+            } if result.resolved_bnet else None,
+            "match_id": result.match_id,
+            "match_kind": result.match_kind,
+            "replies": result.replies,
+        }
+
+    async def handle_dashen_match_detail_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        index_value = payload.get("index")
+        if index_value is None:
+            index_value = payload.get("idx")
+        if index_value is None:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="index is required for match detail image.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","index":0}',
+            )
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","index":0}',
+            )
+
+        target_count = int(payload.get("target_count") or payload.get("limit") or 20)
+        include_fight = _coerce_bool(payload.get("include_fight"), True)
+        include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
+        query = DashenMatchQuery(
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            target_count=target_count,
+            include_fight=include_fight,
+            include_previous_season=include_previous_season,
+        )
+        # 抓取阶段：占用 dashen 队列槽（详情 + risk 补充）
+        output = await self.dashen_request_queue.run(
+            "match_detail_image",
+            lambda: dashen_match_module.fetch_match_detail_by_index(query, int(index_value), for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_match_module.render_match_detail(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen match detail image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_dashen_summary(self, payload: Dict[str, object], *, scope: str = "today") -> Dict[str, object]:
+        if scope == "season":
+            return await self.dashen_request_queue.run(
+                "summary_season",
+                lambda: self._handle_dashen_summary(payload, scope=scope),
+            )
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        full_id = str(payload.get("full_id") or payload.get("fullId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        query = DashenSummaryQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            full_id=full_id,
+            scope=scope,
+        )
+        # 抓取阶段：占用 dashen 队列槽（对局数据 + 详情 + 奖项 + stats）
+        fetched = await self.dashen_request_queue.run(
+            f"summary_{scope}",
+            lambda: dashen_summary_module.fetch_summary(query),
+        )
+        # 渲染阶段：槽外执行（JSON 端点仍产出完整 timings，行为与改造前一致）
+        result = await dashen_summary_module.render_summary(fetched)
+        resolved = result.resolved_bnet
+        return {
+            "ok": True,
+            "scope": result.scope,
+            "title": result.title,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": resolved.query if resolved else (bnet_id or full_id),
+                "full_id": result.full_id,
+                "bnet_id": result.bnet_id,
+                "has_customer_token": bool(result.customer_token),
+            },
+            "summary": {
+                "worker_url": result.worker_url,
+                "match_count": result.match_count,
+                "all_match_count": result.all_match_count,
+                "payload_kb": result.payload_kb,
+                "timings": result.timings,
+            },
+        }
+
+    async def _handle_dashen_summary(self, payload: Dict[str, object], *, scope: str = "today") -> Dict[str, object]:
+        if scope == "season":
+            # 与 image 端点同语义：只认 bnet_id，roleId 与账号由后端解析。
+            bnet_id = str(
+                payload.get("bnet_id") or payload.get("bnetId")
+                or payload.get("full_id") or payload.get("fullId") or ""
+            ).strip()
+            if not bnet_id:
+                raise ModuleError(
+                    error="invalid_season_target",
+                    message="请提供 bnet_id。",
+                    status_code=400,
+                )
+            role_id = await self._resolve_season_role_id(bnet_id)
+            # 调用方已在 dashen_request_queue 槽内（见 handle_dashen_summary），
+            # 这里不能再套一层 run：同一任务重复 acquire 会自锁。
+            report = await self._fetch_season_report(role_id, payload.get("season"))
+            return {
+                "ok": True,
+                "scope": "season",
+                "title": "赛季总结",
+                "roleId": role_id,
+                "season": report["season"].get("season"),
+                "summary": report,
+            }
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        full_id = str(payload.get("full_id") or payload.get("fullId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        result = await dashen_summary_module.query_summary(
+            DashenSummaryQuery(
+                customer_token=customer_token,
+                bnet_id=bnet_id,
+                full_id=full_id,
+                scope=scope,
+            )
+        )
+        resolved = result.resolved_bnet
+        return {
+            "ok": True,
+            "scope": result.scope,
+            "title": result.title,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": resolved.query if resolved else (bnet_id or full_id),
+                "full_id": result.full_id,
+                "bnet_id": result.bnet_id,
+                "has_customer_token": bool(result.customer_token),
+            },
+            "summary": {
+                "worker_url": result.worker_url,
+                "match_count": result.match_count,
+                "all_match_count": result.all_match_count,
+                "payload_kb": result.payload_kb,
+                "timings": result.timings,
+            },
+        }
+
+    async def handle_dashen_summary_image(self, payload: Dict[str, object], *, scope: str = "today") -> tuple[bytes, str]:
+        if scope == "season":
+            from .modules.dashen_summary.season_report import render_report
+            from .modules.dashen_summary.engine import SUMMARY_SEMAPHORE
+            # 与今日总结一致的入参语义：调用方只给战网 ID，数字 roleId 与账号 token
+            # 全部由后端解析（账号从凭据池取，与其它 dashen 指令共用冷却状态）。
+            bnet_id = str(
+                payload.get("bnet_id") or payload.get("bnetId")
+                or payload.get("full_id") or payload.get("fullId") or ""
+            ).strip()
+            if not bnet_id:
+                raise ModuleError(
+                    error="invalid_season_target",
+                    message="请提供 bnet_id。",
+                    status_code=400,
+                )
+            role_id = await self._resolve_season_role_id(bnet_id)
+            # 抓取阶段：占用 dashen 队列槽（账号相关失败自动换号，槽内完成）
+            report = await self.dashen_request_queue.run(
+                "summary_season_image",
+                lambda: self._fetch_season_report(role_id, payload.get("season")),
+            )
+            # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+            async with SUMMARY_SEMAPHORE:
+                return await render_report(report, role_id)
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        full_id = str(payload.get("full_id") or payload.get("fullId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        query = DashenSummaryQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            full_id=full_id,
+            scope=scope,
+        )
+        # 抓取阶段：占用 dashen 队列槽（对局数据 + 详情 + 奖项 + stats）
+        fetched = await self.dashen_request_queue.run(
+            f"summary_{scope}_image",
+            lambda: dashen_summary_module.fetch_summary(query),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        result = await dashen_summary_module.render_summary(fetched)
+        # render_ms comes from worker-reported RENDER_DONE.delta_ms (worker-side render phase only).
+        # Note: summary's upstream_ms already includes worker render round-trip (render_summary is an HTTP call).
+        #   - upstream_ms ~ upstream API calls + worker render round-trip (network + queue + render)
+        #   - render_ms   = worker-side render phase duration (self-reported by worker)
+        #   They do not double-count: upstream_ms includes transport overhead, render_ms is render-only.
+        render_ms = -1
+        for t in result.timings:
+            if t.get("stage") == "RENDER_DONE":
+                render_ms = int(t.get("delta_ms", -1))
+                break
+        self._last_summary_render_ms = render_ms
+        return result.image_bytes, result.image_media_type
+
+    async def _resolve_season_role_id(self, bnet_id: str) -> str:
+        """赛季报告需要的数字 roleId = bnet 搜索接口返回的 data.bnetId。"""
+        output = await bnet_search_module.search(bnet_id, render=False)
+        role_id = str(getattr(output.result, "bnet_id", "") or "").strip()
+        if not role_id.isdigit():
+            raise ModuleError(
+                error="bnet_not_found",
+                message="未能解析该玩家的数字 ID，请确认战网 ID 是否正确。",
+                status_code=404,
+            )
+        return role_id
+
+    async def _fetch_season_report(self, role_id: str, season: object) -> Dict[str, object]:
+        """抓取赛季报告：账号取自凭据池（轮询 + 失效冷却），账号类失败自动换号。"""
+        from .modules.dashen_summary.season_report import fetch_report
+
+        pool = dashen_api_client.credential_pool
+        if not pool.credentials:
+            raise ModuleError(
+                error="season_report_no_account",
+                message="未配置大神账号 token。",
+                status_code=400,
+            )
+        attempts = min(3, len(pool.credentials))
+        last_exc: Optional[ModuleError] = None
+        for attempt in range(attempts):
+            credential = pool.next_credential()
+            try:
+                return await fetch_report(credential.token, role_id, season)
+            except ModuleError as exc:
+                if exc.error not in {"season_report_unavailable", "season_report_upstream_error"}:
+                    raise
+                if exc.error == "season_report_upstream_error":
+                    # 业务码失败通常意味着该账号 token 失效：冷却它，让其它指令绕开
+                    pool.mark_failure(credential, reason=exc.error)
+                last_exc = exc
+                print(
+                    f"[overstats] season_report account attempt {attempt + 1}/{attempts} failed: "
+                    f"error={exc.error}",
+                    flush=True,
+                )
+        if last_exc is not None:
+            raise last_exc
+        raise ModuleError(error="season_report_unavailable", message="赛季报告暂时无法获取，请稍后重试。", status_code=502)
+
+    async def handle_dashen_team_overview(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "team_overview", lambda: team_overview_module.query(payload.get("base64")))
+
+    async def handle_dashen_team_overview_image(self, payload: Dict[str, object]) -> bytes:
+        # 抓取阶段：占用 dashen 队列槽
+        result = await self.dashen_request_queue.run(
+            "team_overview_image", lambda: team_overview_module.query(payload.get("base64"), include_avatars=True))
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        return render_overview(result)
+
+    async def handle_dashen_rank_history(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "rank_history",
+            lambda: self._handle_dashen_rank_history(payload),
+        )
+
+    async def _handle_dashen_rank_history(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+
+        result = await dashen_rank_history_module.query_rank_history(
+            DashenRankHistoryQuery(
+                customer_token=customer_token,
+                bnet_id=bnet_id,
+                start_season=_coerce_optional_int(payload, "start_season", "startSeason"),
+                end_season=_coerce_optional_int(payload, "end_season", "endSeason"),
+            ),
+            render=False,
+        )
+        resolved = result.resolved_bnet
+        seasons = []
+        for item in result.seasons:
+            seasons.append(
+                {
+                    "season": item.get("season"),
+                    "has_competitive": item.get("has_competitive"),
+                    "has_stadium": item.get("has_stadium"),
+                    "competitive": item.get("competitive"),
+                    "stadium": item.get("stadium"),
+                }
+            )
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": resolved.query,
+                "full_id": result.full_id,
+                "bnet_id": result.bnet_id,
+                "has_customer_token": bool(resolved.customer_token),
+            } if resolved else {
+                "query": bnet_id or customer_token,
+                "full_id": result.full_id,
+                "bnet_id": result.bnet_id,
+                "has_customer_token": bool(result.customer_token),
+            },
+            "season_range": {
+                "start_season": result.start_season,
+                "end_season": result.end_season,
+            },
+            "seasons": seasons,
+            "missing_assets": list(result.missing_assets),
+        }
+
+    async def handle_dashen_rank_history_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+
+        query = DashenRankHistoryQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            start_season=_coerce_optional_int(payload, "start_season", "startSeason"),
+            end_season=_coerce_optional_int(payload, "end_season", "endSeason"),
+        )
+        # 抓取阶段：占用 dashen 队列槽（含横幅/资料卡抓取）
+        output = await self.dashen_request_queue.run(
+            "rank_history_image",
+            lambda: dashen_rank_history_module.fetch_rank_history(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_rank_history_module.render_rank_history(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen rank history image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_dashen_quick_strength(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "quick_strength",
+            lambda: self._handle_dashen_quick_strength(payload),
+        )
+
+    async def _handle_dashen_quick_strength(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        limit = _coerce_optional_int(payload, "limit") or 12
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+
+        result = await dashen_quick_strength_module.query_quick_strength(
+            DashenQuickStrengthQuery(
+                customer_token=customer_token,
+                bnet_id=bnet_id,
+                limit=limit,
+                include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+            ),
+            render=False,
+        )
+        resolved = result.resolved_bnet
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "full_id": result.full_id,
+            "bnet_id": result.bnet_id,
+            "resolved": {
+                "query": resolved.query,
+                "full_id": resolved.full_id,
+                "bnet_id": resolved.bnet_id,
+                "has_customer_token": bool(resolved.customer_token),
+            } if resolved else {
+                "query": bnet_id or customer_token,
+                "full_id": result.full_id,
+                "bnet_id": result.bnet_id,
+                "has_customer_token": bool(result.customer_token),
+            },
+            "summary": result.summary.to_dict(),
+            "matches": [item.to_dict() for item in result.matches],
+        }
+
+    async def handle_dashen_quick_strength_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        limit = _coerce_optional_int(payload, "limit") or 12
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+
+        query = DashenQuickStrengthQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            limit=limit,
+            include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+        )
+        # 抓取阶段：占用 dashen 队列槽（含头像/risk 抓取）
+        output = await self.dashen_request_queue.run(
+            "quick_strength_image",
+            lambda: dashen_quick_strength_module.fetch_quick_strength(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_quick_strength_module.render_quick_strength(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen quick strength image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_dashen_competitive_strength(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "competitive_strength",
+            lambda: self._handle_dashen_competitive_strength(payload),
+        )
+
+    async def _handle_dashen_competitive_strength(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        limit = _coerce_optional_int(payload, "limit") or 12
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+
+        result = await dashen_competitive_strength_module.query_competitive_strength(
+            DashenCompetitiveStrengthQuery(
+                customer_token=customer_token,
+                bnet_id=bnet_id,
+                limit=limit,
+                include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+            ),
+            render=False,
+        )
+        resolved = result.resolved_bnet
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "full_id": result.full_id,
+            "bnet_id": result.bnet_id,
+            "resolved": {
+                "query": resolved.query,
+                "full_id": resolved.full_id,
+                "bnet_id": resolved.bnet_id,
+                "has_customer_token": bool(resolved.customer_token),
+            } if resolved else {
+                "query": bnet_id or customer_token,
+                "full_id": result.full_id,
+                "bnet_id": result.bnet_id,
+                "has_customer_token": bool(result.customer_token),
+            },
+            "summary": result.summary.to_dict(),
+            "matches": [item.to_dict() for item in result.matches],
+        }
+
+    async def handle_dashen_competitive_strength_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        limit = _coerce_optional_int(payload, "limit") or 12
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+
+        query = DashenCompetitiveStrengthQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            limit=limit,
+            include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+        )
+        # 抓取阶段：占用 dashen 队列槽（含头像/risk 抓取）
+        output = await self.dashen_request_queue.run(
+            "competitive_strength_image",
+            lambda: dashen_competitive_strength_module.fetch_competitive_strength(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        image = await dashen_competitive_strength_module.render_competitive_strength(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen competitive strength image was not generated.",
+                status_code=500,
+            )
+        return image.content
+
+    async def handle_shiqu(self, payload: Dict[str, object]) -> Dict[str, object]:
+        # 注意：不再整体包进 dashen_request_queue —— 仅抓取阶段占用队列槽
+        # （见 _handle_shiqu），LLM 阶段在槽外执行，可多请求并行发送。
+        return await self._handle_shiqu(payload)
+    async def _handle_shiqu(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        match_count = _coerce_optional_int(payload, "match_count") or 12
+        use_db = _coerce_bool(payload.get("use_db"), False)
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+        query = ShiquQuery(
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+            match_count=match_count,
+            use_db=use_db,
+        )
+        if use_db:
+            # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
+            result = await shiqu_module.analyze_from_db(query)
+        else:
+            # 抓取阶段：占用 dashen 队列槽（与其他指令一致，可占满全部槽位）；
+            # LLM 阶段在槽外执行，受全局 LLM 并发槽约束。
+            prepared = await self.dashen_request_queue.run(
+                "shiqu_fetch",
+                lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
+            )
+            result = await shiqu_module.generate_verdict(prepared)
+        result["ok"] = True
+        return result
+
+    async def handle_shiqu_image(self, payload: Dict[str, object]) -> bytes:
+        # use_db=true 模式：不占用 dashen 并发槽位，直接 DB 读取 + 渲染
+        if _coerce_bool(payload.get("use_db"), False):
+            return await self._handle_shiqu_image(payload)
+        # 与 handle_shiqu 相同：仅抓取阶段进队列槽，LLM 与渲染在槽外执行。
+        return await self._handle_shiqu_image(payload)
+
+    async def _handle_shiqu_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        match_count = _coerce_optional_int(payload, "match_count") or 12
+        use_db = _coerce_bool(payload.get("use_db"), False)
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+        query = ShiquQuery(
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+            match_count=match_count,
+            use_db=use_db,
+        )
+        if use_db:
+            # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
+            result = await shiqu_module.analyze_from_db(query)
+        else:
+            # 抓取阶段：占用 dashen 队列槽（与其他指令一致）；LLM 阶段在槽外执行。
+            prepared = await self.dashen_request_queue.run(
+                "shiqu_fetch",
+                lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
+            )
+            result = await shiqu_module.generate_verdict(prepared)
+        try:
+            from overstats.src.modules.dashen_shiqu.render import render_shiqu_image
+        except ModuleNotFoundError:
+            from src.modules.dashen_shiqu.render import render_shiqu_image
+        generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime()
+        )
+        # PIL 渲染是同步 CPU 密集操作，必须丢到线程池：AsyncRunner 只有一个事件循环，
+        # 在工作协程里直接渲染会把其他请求正在等待的 LLM 流式响应一起卡住，
+        # 表现为「LLM 并发不起作用」（in_progress 长期上不去、各请求排队变慢）。
+        rendered = await asyncio.to_thread(render_shiqu_image, result, generated_at)
+        if not rendered or not rendered.content:
+            raise ModuleError(
+                error="render_failed",
+                message="是区吗判定书图片生成失败。",
+                status_code=500,
+            )
+        return rendered.content
+
+    async def handle_court(self, payload: Dict[str, object]) -> Dict[str, object]:
+        # 注意：不再整体包进 dashen_request_queue —— 仅抓取阶段占用队列槽
+        # （见 _handle_court），LLM 阶段在槽外执行，可多请求并行发送。
+        return await self._handle_court(payload)
+
+    async def _handle_court(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        index = _coerce_optional_int(payload, "index", "idx") or 0
+        use_db = _coerce_bool(payload.get("use_db"), False)
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","index":0}',
+            )
+        query = CourtQuery(
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+            index=index,
+            use_db=use_db,
+        )
+        if use_db:
+            # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
+            result = await court_module.analyze_from_db(query)
+        else:
+            # 抓取阶段：占用 dashen 队列槽（与其他指令一致，可占满全部槽位）；
+            # LLM 阶段在槽外执行，受全局 LLM 并发槽约束。
+            prepared = await self.dashen_request_queue.run(
+                "court_fetch",
+                lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
+            )
+            result = await court_module.generate_verdict(prepared)
+        result["ok"] = True
+        return result
+
+    async def handle_court_image(self, payload: Dict[str, object]) -> bytes:
+        # use_db=true 模式：不占用 dashen 并发槽位，直接 DB 读取 + 渲染
+        if _coerce_bool(payload.get("use_db"), False):
+            return await self._handle_court_image(payload)
+        # 与 handle_court 相同：仅抓取阶段进队列槽，LLM 与渲染在槽外执行。
+        return await self._handle_court_image(payload)
+
+    async def _handle_court_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        index = _coerce_optional_int(payload, "index", "idx") or 0
+        use_db = _coerce_bool(payload.get("use_db"), False)
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","index":0}',
+            )
+        query = CourtQuery(
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+            index=index,
+            use_db=use_db,
+        )
+        if use_db:
+            # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
+            result = await court_module.analyze_from_db(query)
+        else:
+            # 抓取阶段：占用 dashen 队列槽（与其他指令一致）；LLM 阶段在槽外执行。
+            prepared = await self.dashen_request_queue.run(
+                "court_fetch",
+                lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
+            )
+            result = await court_module.generate_verdict(prepared)
+        try:
+            from overstats.src.modules.dashen_court.render import render_court_image
+        except ModuleNotFoundError:
+            from src.modules.dashen_court.render import render_court_image
+        generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime()
+        )
+        # 同 shiqu：同步渲染不能在事件循环线程里跑，否则阻塞并发中的 LLM 调用。
+        rendered = await asyncio.to_thread(render_court_image, result, generated_at)
+        if not rendered or not rendered.content:
+            raise ModuleError(
+                error="render_failed",
+                message="电竞法庭判决书图片生成失败。",
+                status_code=500,
+            )
+        return rendered.content
+
+
+class _PerfAccumulator:
+    """Per-request accumulator reused for queue_wait (and future stages)."""
+    __slots__ = ("total_ms",)
+
+    def __init__(self) -> None:
+        self.total_ms = 0
+
+    def add(self, ms: int) -> None:
+        self.total_ms += int(ms or 0)
+
+
+_queue_wait_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = contextvars.ContextVar(
+    "overstats_queue_wait", default=None
+)
+
+_memory_cache_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = contextvars.ContextVar(
+    "overstats_memory_cache_hits", default=None
+)
+_db_read_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = contextvars.ContextVar(
+    "overstats_db_read_hits", default=None
+)
+
+# 当前请求的标识（战网 ID / 监听端口 / 路径），用于抓取完成与异常日志。
+_req_bnet_var: contextvars.ContextVar[str] = contextvars.ContextVar("overstats_req_bnet", default="")
+_req_port_var: contextvars.ContextVar[int] = contextvars.ContextVar("overstats_req_port", default=0)
+_req_path_var: contextvars.ContextVar[str] = contextvars.ContextVar("overstats_req_path", default="")
+_req_fetch_end_var: contextvars.ContextVar[float] = contextvars.ContextVar("overstats_fetch_end", default=0.0)
+
+
+def log_internal_error(exc: BaseException) -> None:
+    """未捕获异常统一落日志：之前 500 只回包不打印，线上无法定位。"""
+    try:
+        print(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [INTERNAL ERROR] "
+            f"path={_req_path_var.get() or '-'} bnet={_req_bnet_var.get() or '-'} "
+            f"port={_req_port_var.get() or '-'} {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        traceback.print_exc()
+    except Exception:
+        pass
+
+
+def _clock_ms(epoch_seconds: float) -> str:
+    """HH:MM:SS.mmm，便于在日志里直接对比抓取/渲染时间点。"""
+    return time.strftime("%H:%M:%S", time.localtime(epoch_seconds)) + f".{int((epoch_seconds % 1) * 1000):03d}"
+
+
+def log_fetch_done(label: str, started_at_wall: float, finished_at_wall: float, wait_ms: int) -> None:
+    """抓取阶段结束（= 渲染开始）打印一行：时间 / 战网ID / 端口 / 抓取起止。"""
+    cost_ms = int((finished_at_wall - started_at_wall) * 1000)
+    _req_fetch_end_var.set(float(finished_at_wall))
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [FETCH DONE] "
+        f"bnet={_req_bnet_var.get() or '-'} port={_req_port_var.get() or '-'} task={label} "
+        f"fetch={_clock_ms(started_at_wall)}->{_clock_ms(finished_at_wall)} ({cost_ms}ms) wait={wait_ms}ms",
+        flush=True,
+    )
+
+
+def log_render_done(total_ms: int) -> None:
+    """渲染（含 shiqu/court 的 LLM 等待）结束打印一行，与 FETCH DONE 配对。"""
+    fetch_end = float(_req_fetch_end_var.get() or 0.0)
+    if fetch_end <= 0:
+        return
+    finished = time.time()
+    render_ms = max(0, int((finished - fetch_end) * 1000))
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [RENDER DONE] "
+        f"bnet={_req_bnet_var.get() or '-'} port={_req_port_var.get() or '-'} "
+        f"render={_clock_ms(fetch_end)}->{_clock_ms(finished)} ({render_ms}ms) total={int(total_ms)}ms",
+        flush=True,
+    )
+
+
+def log_request_received(body_bytes: int) -> None:
+    """收到 HTTP 请求（body 读取+解析完成）立刻打印一行 [RECV]。
+
+    时刻与 FETCH DONE 的 fetch 起点对齐，可看出请求在进入抓取队列前的开销；
+    也与插件侧 [SEND] 行对齐，用于测量 插件→后端 的链路耗时（同机毫秒级可比）。
+    """
+    now = time.time()
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [RECV] "
+        f"bnet={_req_bnet_var.get() or '-'} port={_req_port_var.get() or '-'} "
+        f"path={_req_path_var.get() or '-'} body={body_bytes}B at={_clock_ms(now)}",
+        flush=True,
+    )
+
+
+def _extract_request_bnet(payload: Any) -> str:
+    """从请求体里取战网 ID（不同接口字段名不同，取第一个非空）。"""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("bnet_id", "target_bnet_id", "player", "player1", "full_id", "name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def report_db_cache_hit(source: str = "memory", count: int = 1) -> None:
+    """Modules call this to report a cache or DB hit.
+    source='memory' for in-memory cache hits, source='db' for DB read hits.
+    """
+    var = _memory_cache_acc_var if source == "memory" else _db_read_acc_var
+    acc = var.get()
+    if acc is not None:
+        acc.add(count)
+
+
+def report_upstream_call(label: str = "unknown") -> None:
+    """Non-DashenAPIClient modules call this to report an upstream HTTP call."""
+    acc = _upstream_acc_var.get()
+    if acc is not None:
+        acc.add(0, label)
+
+
+class AsyncRunner:
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run_loop, name="overstats-async-loop", daemon=True)
+        self.thread.start()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def run(self, coro):
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result()
+
+    def submit(self, coro) -> None:
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+        def _on_done(done_future) -> None:
+            try:
+                done_future.result()
+            except Exception as exc:
+                print(f"[overstats] async background task failed: {exc}")
+
+        future.add_done_callback(_on_done)
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5)
+        if not self.loop.is_closed():
+            self.loop.close()
+
+
+def create_server(config: APIConfig) -> ThreadingHTTPServer:
+    # Purge legacy identity storage even when database writes are disabled.
+    from .db.privacy import purge_player_storage
+    purge_player_storage()
+    query_tool_config = load_query_tool()
+    service = OverstatsCoreService(
+        dashen_max_concurrent_requests=config.dashen_max_concurrent_requests,
+        dashen_max_accepted_requests=config.dashen_max_accepted_requests,
+        dashen_light_load_threshold=config.dashen_light_load_threshold,
+    )
+    print(
+        "[overstats] dashen request queue enabled "
+        f"max_concurrent={config.dashen_max_concurrent_requests} "
+        f"max_accepted={config.dashen_max_accepted_requests} "
+        f"light_load_threshold={config.dashen_light_load_threshold}"
+    )
+    print(f"[overstats] database writes enabled={config.enable_database_write}")
+    async_runner = AsyncRunner()
+
+    def _start_recorder(name: str, coro) -> bool:
+        """启动数据库 recorder；失败降级为「不落库」而不是让进程退出。
+
+        DB 写入是可选增强：sqlite 锁竞争（典型：旧后端实例未退出仍持有写锁，
+        报 database is locked）不应拖垮整个 HTTP 服务。
+        """
+        try:
+            async_runner.run(coro)
+            return True
+        except Exception as exc:
+            print(
+                f"[overstats] {name} disabled: {type(exc).__name__}: {exc} "
+                "（若为 database is locked，请确认没有其它后端实例仍在运行）",
+                flush=True,
+            )
+            return False
+
+    request_metrics_recorder = RequestMetricsRecorder() if config.enable_database_write else None
+    if request_metrics_recorder is not None:
+        _start_recorder("request-metrics-recorder", request_metrics_recorder.start())
+    endpoint_perf_recorder = EndpointPerfRecorder() if config.enable_database_write else None
+    if endpoint_perf_recorder is not None:
+        _start_recorder("endpoint-perf-recorder", endpoint_perf_recorder.start())
+    match_detail_recorder = MatchDetailRecorder() if config.enable_database_write else None
+    if match_detail_recorder is not None:
+        _start_recorder("match-detail-recorder", match_detail_recorder.start())
+    player_identity_recorder = None
+    if player_identity_recorder is not None:
+        async_runner.run(player_identity_recorder.start())
+    if config.enable_database_write:  # shiqu_llm_recorder.start() 在开关关闭时自动 no-op
+        _start_recorder("shiqu-llm-recorder", shiqu_llm_recorder.start())
+        _start_recorder("court-llm-recorder", court_llm_recorder.start())
+    # LLM 调用状态定时打印（每 10 秒）：独立于开关，始终在事件循环上运行。
+    # 注意：该协程为 while True 死循环，必须用 submit（即发即弃），不能用 run（会阻塞主线程）。
+    async_runner.submit(
+        start_llm_status_reporter(
+            shiqu_llm_status,
+            court_llm_status,
+            shiqu_llm_recorder,
+            court_llm_recorder,
+        )
+    )
+    ow_hero_leaderboard_sync_service = OWHeroLeaderboardSyncService()
+    _start_recorder("ow-hero-leaderboard-sync", ow_hero_leaderboard_sync_service.start())
+    previous_match_detail_recorder = dashen_api_client.match_detail_recorder
+    previous_player_identity_recorder = dashen_api_client.player_identity_recorder
+    previous_request_metrics_recorder = dashen_api_client.request_metrics_recorder
+    dashen_api_client.match_detail_recorder = match_detail_recorder
+    dashen_api_client.player_identity_recorder = player_identity_recorder
+    dashen_api_client.request_metrics_recorder = request_metrics_recorder
+
+    class OverstatsRequestHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "OverstatsCore/0.1"
+
+        def _request_path(self) -> str:
+            normalized = normalize_request_metric_url(self.path)
+            return normalized.rstrip("/") or "/"
+
+        def do_GET(self) -> None:
+            path = self._request_path()
+            self._set_metrics_context(path if path.startswith("/api/v2/") else None)
+            try:
+                _req_port_var.set(int(self.server.server_address[1]))
+                _req_path_var.set(path)
+            except Exception:
+                pass
+            self._perf_handler_start = time.monotonic()
+            self._perf_service_ms = 0
+            self._perf_upstream_ms = 0
+            self._perf_render_ms = -1
+            self._perf_queue_wait_ms = -1
+            self._perf_upstream_count = 0
+            self._perf_memory_cache_hits = 0
+            self._perf_db_read_hits = 0
+            self._perf_upstream_breakdown = {}
+            if path == "/api/v2/metrics":
+                self._handle_metrics_get()
+                return
+
+            if path == "/healthz":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "service": "overstats-core",
+                        "default_stream": config.use_stream_response,
+                        "dashen_max_concurrent_requests": config.dashen_max_concurrent_requests,
+                        "dashen_max_accepted_requests": config.dashen_max_accepted_requests,
+                        "dashen_light_load_threshold": config.dashen_light_load_threshold,
+                    },
+                )
+                return
+
+            ui_asset = resolve_http_ui_asset(path)
+            if ui_asset is not None:
+                self._send_binary(ui_asset.status, ui_asset.body, ui_asset.content_type)
+                return
+
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "ok": False,
+                    "error": "not_found",
+                },
+            )
+
+        def do_POST(self) -> None:
+            path = self._request_path()
+            self._set_metrics_context(path if path.startswith("/api/v2/") else None)
+            try:
+                _req_port_var.set(int(self.server.server_address[1]))
+                _req_path_var.set(path)
+                _req_fetch_end_var.set(0.0)
+            except Exception:
+                pass
+            self._perf_handler_start = time.monotonic()
+            self._perf_service_ms = 0
+            self._perf_upstream_ms = 0
+            self._perf_render_ms = -1
+            self._perf_queue_wait_ms = -1
+            self._perf_upstream_count = 0
+            self._perf_memory_cache_hits = 0
+            self._perf_db_read_hits = 0
+            self._perf_upstream_breakdown = {}
+            if path == "/api/v2/auto-route":
+                self._handle_auto_route_post()
+                return
+
+            if path == "/api/v2/internal/player-identity/search":
+                self._handle_player_identity_search_post()
+                return
+
+            if path == "/api/v2/internal/rank-distribution/image":
+                self._handle_internal_rank_distribution_image_post()
+                return
+
+            if path == "/api/v2/blizzard-player-search":
+                self._handle_blizzard_player_search_post()
+                return
+
+            if path == "/api/v2/blizzard-profile/image":
+                self._handle_blizzard_profile_image_post()
+                return
+
+            if path == "/api/v2/blizzard-profile":
+                self._handle_blizzard_profile_post()
+                return
+
+            if path == "/api/v2/patch-notes/image":
+                self._handle_patch_notes_image_post()
+                return
+
+            if path == "/api/v2/patch-notes/replies":
+                self._handle_patch_notes_post(replies=True)
+                return
+
+            if path == "/api/v2/patch-notes":
+                self._handle_patch_notes_post()
+                return
+
+            if path == "/api/v2/ow-hero-perk/image":
+                self._handle_ow_hero_perk_image_post()
+                return
+
+            if path == "/api/v2/ow-hero-perk":
+                self._handle_ow_hero_perk_post()
+                return
+
+            if path in {"/api/v2/ow_hero_wiki/image", "/api/v2/ow-hero-wiki/image"}:
+                self._handle_ow_hero_wiki_image_post()
+                return
+
+            if path in {"/api/v2/ow_hero_wiki", "/api/v2/ow-hero-wiki"}:
+                self._handle_ow_hero_wiki_post()
+                return
+
+            if path == "/api/v2/ow-hero-pick-rate/image":
+                self._handle_ow_hero_pick_rate_image_post()
+                return
+
+            if path == "/api/v2/ow-hero-pick-rate":
+                self._handle_ow_hero_pick_rate_post()
+                return
+
+            if path == "/api/v2/dashen-rank-leaderboard/image":
+                self._handle_dashen_rank_leaderboard_image_post()
+                return
+
+            if path == "/api/v2/dashen-rank-leaderboard":
+                self._handle_dashen_rank_leaderboard_post()
+                return
+
+            if path == "/api/v2/dashen-hero-leaderboard/image":
+                self._handle_dashen_hero_leaderboard_image_post()
+                return
+
+            if path == "/api/v2/dashen-hero-leaderboard":
+                self._handle_dashen_hero_leaderboard_post()
+                return
+
+            if path == "/api/v2/ow-shop/image":
+                self._handle_ow_shop_image_post()
+                return
+
+            if path == "/api/v2/ow-shop":
+                self._handle_ow_shop_post()
+                return
+
+            if path == "/api/v2/ow-esports/image":
+                self._handle_ow_esports_image_post()
+                return
+
+            if path == "/api/v2/ow-esports":
+                self._handle_ow_esports_post()
+                return
+
+            if path == "/api/v2/ow-guess/replies":
+                self._handle_ow_guess_replies_post()
+                return
+
+            # Season report is API-only until its layout is approved.
+            if path == "/api/v2/dashen-summary/season/image":
+                self._handle_dashen_summary_image_post(scope="season")
+                return
+
+            if path == "/api/v2/dashen-summary/season":
+                self._handle_dashen_summary_post(scope="season")
+                return
+
+            if path == "/api/v2/dashen-summary/week/image":
+                self._handle_dashen_summary_image_post("week")
+                return
+
+            if path == "/api/v2/dashen-summary/week":
+                self._handle_dashen_summary_post("week")
+                return
+
+            if path == "/api/v2/dashen-summary/yesterday/image":
+                self._handle_dashen_summary_image_post("yesterday")
+                return
+
+            if path == "/api/v2/dashen-summary/yesterday":
+                self._handle_dashen_summary_post("yesterday")
+                return
+
+            if path == "/api/v2/dashen-summary/today/image":
+                self._handle_dashen_summary_image_post("today")
+                return
+
+            if path == "/api/v2/dashen-summary/today":
+                self._handle_dashen_summary_post("today")
+                return
+
+            if path == "/api/v2/dashen-profile/image":
+                self._handle_dashen_profile_image_post()
+                return
+
+            if path == "/api/v2/dashen-profile":
+                self._handle_dashen_profile_post()
+                return
+
+            if path in {"/api/v2/career-personality", "/api/v2/career-personality/image"}:
+                self._handle_career_personality_post(render=path.endswith("/image"))
+                return
+            if path in {"/api/v2/career-compare", "/api/v2/career-compare/image"}:
+                self._handle_career_compare_post(render=path.endswith("/image"))
+                return
+            if path == "/api/v2/dashen-hero-compare/image":
+                self._handle_dashen_hero_compare_image_post()
+                return
+            if path == "/api/v2/dashen-hero-compare":
+                self._handle_dashen_hero_compare_post()
+                return
+            if path == "/api/v2/dashen-hero-treemap/image":
+                self._handle_dashen_hero_treemap_image_post()
+                return
+
+            if path == "/api/v2/dashen-hero-treemap":
+                self._handle_dashen_hero_treemap_post()
+                return
+
+            if path == "/api/v2/dashen-team-overview/image":
+                self._handle_dashen_team_overview_image_post()
+                return
+            if path == "/api/v2/dashen-team-overview":
+                self._handle_dashen_team_overview_post()
+                return
+
+            if path == "/api/v2/dashen-rank-history/image":
+                self._handle_dashen_rank_history_image_post()
+                return
+
+            if path == "/api/v2/dashen-rank-history":
+                self._handle_dashen_rank_history_post()
+                return
+
+            if path == "/api/v2/dashen-quick-strength/image":
+                self._handle_dashen_quick_strength_image_post()
+                return
+
+            if path == "/api/v2/dashen-quick-strength":
+                self._handle_dashen_quick_strength_post()
+                return
+
+            if path == "/api/v2/dashen-competitive-strength/image":
+                self._handle_dashen_competitive_strength_image_post()
+                return
+
+            if path == "/api/v2/dashen-competitive-strength":
+                self._handle_dashen_competitive_strength_post()
+                return
+
+            if path == "/api/v2/dashen-shiqu/image":
+                self._handle_shiqu_image_post()
+                return
+
+            if path == "/api/v2/dashen-shiqu":
+                self._handle_shiqu_post()
+                return
+
+            if path == "/api/v2/dashen-court/image":
+                self._handle_court_image_post()
+                return
+
+            if path == "/api/v2/dashen-court":
+                self._handle_court_post()
+                return
+
+
+            if path == "/api/v2/dashen-match/detail/replies":
+                self._handle_dashen_match_detail_replies_post()
+                return
+
+            if path == "/api/v2/dashen-match/detail/image":
+                self._handle_dashen_match_detail_image_post()
+                return
+
+            if path == "/api/v2/dashen-match/detail":
+                self._handle_dashen_match_detail_post()
+                return
+
+            if path == "/api/v2/dashen-match/replies":
+                self._handle_dashen_match_replies_post()
+                return
+
+            if path == "/api/v2/dashen-match/image":
+                self._handle_dashen_match_image_post()
+                return
+
+            if path == "/api/v2/dashen-match":
+                self._handle_dashen_match_post()
+                return
+
+            if path == "/api/v2/dashen-sameplay/detail/replies":
+                self._handle_dashen_sameplay_detail_replies_post()
+                return
+
+            if path == "/api/v2/dashen-sameplay/detail/image":
+                self._handle_dashen_sameplay_detail_image_post()
+                return
+
+            if path == "/api/v2/dashen-sameplay/detail":
+                self._handle_dashen_sameplay_detail_post()
+                return
+
+            if path == "/api/v2/dashen-sameplay/replies":
+                self._handle_dashen_sameplay_replies_post()
+                return
+
+            if path == "/api/v2/dashen-sameplay/image":
+                self._handle_dashen_sameplay_image_post()
+                return
+
+            if path == "/api/v2/dashen-sameplay":
+                self._handle_dashen_sameplay_post()
+                return
+
+            if path != "/api/v2/query":
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "ok": False,
+                        "error": "not_found",
+                    },
+                )
+                return
+
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            route = str(payload.get("route") or "default")
+            text = str(payload.get("text") or "")
+            stream = _coerce_bool(payload.get("stream"), config.use_stream_response)
+            extra = payload.get("extra")
+            if extra is not None and not isinstance(extra, dict):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_extra",
+                        "message": "extra must be an object when provided",
+                    },
+                )
+                return
+
+            if stream:
+                self._send_stream(
+                    HTTPStatus.OK,
+                    service.iter_query_events(
+                        route=route,
+                        text=text,
+                        stream=True,
+                        extra=extra,
+                    ),
+                )
+                return
+
+            self._send_json(
+                HTTPStatus.OK,
+                service.handle_query(
+                    route=route,
+                    text=text,
+                    stream=False,
+                    extra=extra,
+                ),
+            )
+
+        def _handle_player_identity_search_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_player_identity_search(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_internal_rank_distribution_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(service.handle_internal_rank_distribution_image(payload))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_blizzard_player_search_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_blizzard_player_search(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_blizzard_profile_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_blizzard_profile(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_blizzard_profile_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_blizzard_profile_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_auto_route_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_auto_route(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_match_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_match(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            status = HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST
+            self._send_json(status, result)
+
+        def _handle_dashen_match_replies_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_match_replies(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_sameplay_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_sameplay_replies_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_replies(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_sameplay_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_ow_shop_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_ow_shop(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_ow_shop_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_result = async_runner.run(self._capture_perf(service.handle_ow_shop_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            image_body = image_result
+            content_type = "image/png"
+            if isinstance(image_result, tuple):
+                image_body, content_type = image_result
+            self._send_binary(HTTPStatus.OK, image_body, content_type)
+
+        def _handle_ow_esports_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_ow_esports(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_ow_esports_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_ow_esports_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_ow_guess_replies_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_ow_guess_replies(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_patch_notes_post(self, *, replies=False) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                patch_handler = service.handle_patch_notes_replies if replies else service.handle_patch_notes
+                result = async_runner.run(self._capture_perf(patch_handler(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_patch_notes_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_patch_notes_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_ow_hero_perk_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_ow_hero_perk(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_ow_hero_perk_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_perk_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_ow_hero_wiki_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_ow_hero_wiki(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_ow_hero_wiki_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_wiki_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_ow_hero_pick_rate_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_ow_hero_pick_rate(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_ow_hero_pick_rate_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_pick_rate_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_rank_leaderboard_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_rank_leaderboard(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_rank_leaderboard_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_rank_leaderboard_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_hero_leaderboard_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_hero_leaderboard(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_hero_leaderboard_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_hero_leaderboard_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_profile_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_profile(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            status = HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST
+            self._send_json(status, result)
+
+        def _handle_dashen_profile_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_profile_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_career_personality_post(self, *, render=False) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": "请求体必须是 JSON 对象。"})
+                return
+            try:
+                result = async_runner.run(service.handle_career_personality(payload, render=render))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message})
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "career_personality_failed", "message": "生涯人格暂不可用，请稍后重试。"})
+                return
+            if render:
+                self._send_binary(HTTPStatus.OK, result, "image/png")
+            else:
+                self._send_json(HTTPStatus.OK, result)
+
+        def _handle_career_compare_post(self, *, render=False) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": "请求体必须是 JSON 对象。"})
+                return
+            try:
+                result = async_runner.run(service.handle_career_compare(payload, render=render))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message})
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "career_compare_failed", "message": "生涯对比暂不可用，请稍后重试。"})
+                return
+            if render:
+                self._send_binary(HTTPStatus.OK, result, "image/png")
+            else:
+                self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_hero_compare_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(service.handle_dashen_hero_compare(payload))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_hero_compare_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(service.handle_dashen_hero_compare_image(payload))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_hero_treemap_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_hero_treemap(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_hero_treemap_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_hero_treemap_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_team_overview_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(service.handle_dashen_team_overview(payload))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_team_overview_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(service.handle_dashen_team_overview_image(payload))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_rank_history_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_rank_history(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_rank_history_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_rank_history_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_quick_strength_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_quick_strength(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_quick_strength_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_quick_strength_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_shiqu_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_shiqu(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_shiqu_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_shiqu_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_court_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_court(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_court_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_court_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_competitive_strength_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_competitive_strength(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_competitive_strength_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_competitive_strength_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_summary_post(self, scope: str) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_summary(payload, scope=scope)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_summary_image_post(self, scope: str) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body, content_type = async_runner.run(self._capture_perf(service.handle_dashen_summary_image(payload, scope=scope)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._perf_render_ms = getattr(service, "_last_summary_render_ms", -1)
+            self._send_binary(HTTPStatus.OK, image_body, content_type)
+
+        def _handle_dashen_match_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_match_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_match_detail_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_match_detail(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_match_detail_replies_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_match_detail_replies(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_match_detail_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_match_detail_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_dashen_sameplay_detail_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_sameplay_detail_replies_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail_replies(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_sameplay_detail_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail_image(payload)))
+            except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                log_internal_error(exc)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        async def _capture_perf(self, coro):
+            """Wrap a service coroutine to measure performance.
+
+            Installs per-request contextvar accumulators and measures service_ms:
+              - upstream accumulator: filled by SafeClient._request_with_retry (apiclient.py)
+              - queue_wait accumulator: filled by DashenRequestQueue.run
+              - memory_cache accumulator: filled by report_db_cache_hit(source='memory')
+              - db_read accumulator: filled by report_db_cache_hit(source='db')
+
+            All run in the same async Task as coro, so contextvars isolate them
+            per request even under ThreadingHTTPServer's multi-handler concurrency.
+            """
+            upstream_acc = _UpstreamAcc()
+            queue_wait_acc = _PerfAccumulator()
+            memory_cache_acc = _PerfAccumulator()
+            db_read_acc = _PerfAccumulator()
+            up_token = _upstream_acc_var.set(upstream_acc)
+            qw_token = _queue_wait_acc_var.set(queue_wait_acc)
+            mc_token = _memory_cache_acc_var.set(memory_cache_acc)
+            dr_token = _db_read_acc_var.set(db_read_acc)
+            t0 = time.monotonic()
+            try:
+                result = await coro
+                return result
+            finally:
+                self._perf_service_ms = int((time.monotonic() - t0) * 1000)
+                log_render_done(self._perf_service_ms)
+                self._perf_upstream_ms = upstream_acc.total_ms
+                self._perf_upstream_count = upstream_acc.call_count
+                self._perf_queue_wait_ms = queue_wait_acc.total_ms
+                self._perf_memory_cache_hits = memory_cache_acc.total_ms
+                self._perf_db_read_hits = db_read_acc.total_ms
+                self._perf_upstream_breakdown = dict(upstream_acc.call_breakdown)
+                _db_read_acc_var.reset(dr_token)
+                _memory_cache_acc_var.reset(mc_token)
+                _queue_wait_acc_var.reset(qw_token)
+                _upstream_acc_var.reset(up_token)
+
+        def _set_metrics_context(self, url: Optional[str]) -> None:
+            if not config.enable_database_write:
+                self._request_metrics_url = None
+                self._request_metrics_recorded = False
+                return
+            normalized = normalize_request_metric_url(str(url or "").strip())
+            self._request_metrics_url = normalized or None
+            self._request_metrics_recorded = False
+
+        def _record_module_metric(self, status: HTTPStatus, *, success: bool) -> None:
+            if not config.enable_database_write or request_metrics_recorder is None:
+                return
+            metrics_url = getattr(self, "_request_metrics_url", None)
+            if not metrics_url or getattr(self, "_request_metrics_recorded", False):
+                return
+            self._request_metrics_recorded = True
+            async_runner.submit(request_metrics_recorder.enqueue(metrics_url, "module", success))
+
+        def _record_json_metric(self, status: HTTPStatus, payload: Dict[str, object]) -> None:
+            success = _is_success_status(status) and payload.get("ok") is True
+            self._record_module_metric(status, success=success)
+            self._record_perf(status, success=success)
+
+        def _record_binary_metric(self, status: HTTPStatus) -> None:
+            self._record_module_metric(status, success=_is_success_status(status))
+            self._record_perf(status, success=_is_success_status(status))
+
+        def _record_stream_metric(self, status: HTTPStatus) -> None:
+            self._record_module_metric(status, success=_is_success_status(status))
+            self._record_perf(status, success=_is_success_status(status))
+
+        def _record_perf(self, status: HTTPStatus, *, success: bool) -> None:
+            if not config.enable_database_write or endpoint_perf_recorder is None:
+                return
+            metrics_url = getattr(self, "_request_metrics_url", None)
+            if not metrics_url:
+                return
+            total_ms = int((time.monotonic() - self._perf_handler_start) * 1000)
+            async_runner.submit(endpoint_perf_recorder.enqueue(
+                url=metrics_url,
+                http_status=int(status),
+                total_ms=total_ms,
+                service_ms=int(getattr(self, "_perf_service_ms", 0)),
+                upstream_ms=int(getattr(self, "_perf_upstream_ms", 0)),
+                render_ms=int(getattr(self, "_perf_render_ms", -1)),
+                queue_wait_ms=int(getattr(self, "_perf_queue_wait_ms", -1)),
+                upstream_count=int(getattr(self, "_perf_upstream_count", 0)),
+                memory_cache_hits=int(getattr(self, "_perf_memory_cache_hits", 0)),
+                db_read_hits=int(getattr(self, "_perf_db_read_hits", 0)),
+                upstream_breakdown=json.dumps(getattr(self, "_perf_upstream_breakdown", {}), ensure_ascii=False),
+                success=success,
+            ))
+
+        def _handle_metrics_get(self) -> None:
+            # Parse ?minutes= query parameter
+            raw_minutes = 360
+            try:
+                from urllib.parse import parse_qs, urlsplit
+                query = parse_qs(urlsplit(self.path).query)
+                raw_minutes = int(query.get("minutes", ["360"])[0])
+            except Exception:
+                raw_minutes = 360
+
+            summary: List[Dict[str, Any]] = []
+            recent: List[Dict[str, Any]] = []
+            module_stats: List[Dict[str, Any]] = []
+            if endpoint_perf_recorder is not None:
+                try:
+                    summary = endpoint_perf_recorder.read_endpoint_perf_summary(minutes=raw_minutes)
+                except Exception as exc:
+                    log_internal_error(exc)
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                        "ok": False, "error": "perf_summary_failed", "message": str(exc),
+                    })
+                    return
+                try:
+                    recent = endpoint_perf_recorder.read_endpoint_perf(limit=50)
+                except Exception:
+                    recent = []
+            if request_metrics_recorder is not None:
+                try:
+                    module_stats = request_metrics_recorder.read_all_module_stats()
+                except Exception:
+                    module_stats = []
+
+            self._send_json(HTTPStatus.OK, {
+                "ok": True,
+                "window_minutes": raw_minutes,
+                "endpoint_performance": summary,
+                "recent_samples": recent,
+                "request_counts": module_stats,
+            })
+
+        def _read_json_body(self) -> Dict[str, object]:
+            length_header = self.headers.get("Content-Length")
+            length = int(length_header) if length_header else 0
+            raw_body = self.rfile.read(length) if length > 0 else b"{}"
+            if not raw_body.strip():
+                return {}
+            try:
+                data = json.loads(self._decode_body(raw_body))
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    "request body is not valid UTF-8/GBK JSON text; "
+                    "Windows cmd users can avoid this by using ASCII bnet_id or --data-binary @body.json"
+                ) from exc
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"malformed json body: {exc.msg}") from exc
+            if not isinstance(data, dict):
+                raise ValueError("json body must be an object")
+            _req_bnet_var.set(_extract_request_bnet(data))
+            log_request_received(len(raw_body))
+            return data
+
+        def _decode_body(self, raw_body: bytes) -> str:
+            content_type = self.headers.get("Content-Type") or ""
+            charset = ""
+            for item in content_type.split(";"):
+                item = item.strip()
+                if item.lower().startswith("charset="):
+                    charset = item.split("=", 1)[1].strip()
+                    break
+
+            encodings = []
+            if charset:
+                encodings.append(charset)
+            encodings.extend(["utf-8", "utf-8-sig", "gbk", locale.getpreferredencoding(False)])
+
+            last_error = None
+            for encoding in dict.fromkeys(encodings):
+                try:
+                    return raw_body.decode(encoding)
+                except UnicodeDecodeError as exc:
+                    last_error = exc
+            if last_error:
+                raise last_error
+            return raw_body.decode("utf-8")
+
+        def _send_json(self, status: HTTPStatus, payload: Dict[str, object]) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            self._record_json_metric(status, payload)
+
+        def _send_binary(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+            # 空 body 守卫：历史上渲染异常曾产出 200 + 0 字节响应，插件会把空文件
+            # 当图片上传 QQ 富媒体接口，触发上传返回 None + 5×30s 重试风暴。
+            # 这里统一拦截：空内容一律按 500 JSON 错误返回，让上游得到可读的错误。
+            if not body:
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [EMPTY BODY] "
+                    f"path={_req_path_var.get() or '-'} bnet={_req_bnet_var.get() or '-'} "
+                    f"port={_req_port_var.get() or '-'} 渲染返回 0 字节",
+                    flush=True,
+                )
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "empty_binary_response",
+                        "message": "Generated binary payload was empty.",
+                    },
+                )
+                return
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # 客户端提前断开连接（超时/取消），非服务端错误，静默忽略
+                pass
+            self._record_binary_metric(status)
+
+        def _send_stream(
+            self,
+            status: HTTPStatus,
+            events: Iterable[Dict[str, object]],
+        ) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            try:
+                for item in events:
+                    self._write_chunk((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
+
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            self._record_stream_metric(status)
+
+        def _write_chunk(self, data: bytes) -> None:
+            if not data:
+                return
+            size = f"{len(data):X}\r\n".encode("ascii")
+            self.wfile.write(size)
+            self.wfile.write(data)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+
+    server = ThreadingHTTPServer((config.host, config.port), OverstatsRequestHandler)
+    asset_warmup_stop = start_query_tool_asset_warmup(query_tool_config)
+    original_server_close = server.server_close
+
+    def server_close() -> None:
+        asset_warmup_stop.set()
+        dashen_api_client.match_detail_recorder = previous_match_detail_recorder
+        dashen_api_client.player_identity_recorder = previous_player_identity_recorder
+        dashen_api_client.request_metrics_recorder = previous_request_metrics_recorder
+        async_runner.run(ow_hero_leaderboard_sync_service.close())
+        if player_identity_recorder is not None:
+            async_runner.run(player_identity_recorder.close())
+        if match_detail_recorder is not None:
+            async_runner.run(match_detail_recorder.close())
+        if request_metrics_recorder is not None:
+            async_runner.run(request_metrics_recorder.close())
+        if endpoint_perf_recorder is not None:
+            async_runner.run(endpoint_perf_recorder.close())
+        if config.enable_database_write:  # 排空队列后再关闭（开关关闭时 close() 自动 no-op）
+            async_runner.run(shiqu_llm_recorder.close())
+            async_runner.run(court_llm_recorder.close())
+        async_runner.close()  # 始终关闭服务事件循环，与数据库写入开关无关
+        original_server_close()  # 始终关闭监听 socket，与数据库写入开关无关
+
+    server.server_close = server_close
+    server.ow_hero_leaderboard_sync_service = ow_hero_leaderboard_sync_service
+    return server

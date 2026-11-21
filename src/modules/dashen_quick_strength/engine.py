@@ -1,0 +1,697 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import contextmanager
+import time
+import uuid
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+try:
+    from overstats.src.constants.ranks import get_rank_score, raw_rank_score_to_strength, strength_score_to_rank
+except ModuleNotFoundError:
+    from src.constants.ranks import get_rank_score, raw_rank_score_to_strength, strength_score_to_rank
+
+from .requests import DashenQuickStrengthRequests, get_live_dashen_season
+
+try:
+    from overstats.src.db.match_stats import IDPoolDB
+    from overstats.src.modules.dashen_request_cache import current_cache_week, rank_singleflight
+except ModuleNotFoundError:
+    from src.db.match_stats import IDPoolDB
+    from src.modules.dashen_request_cache import current_cache_week, rank_singleflight
+
+
+DEFAULT_MATCH_LIMIT = 12
+MIN_MATCH_LIMIT = 3
+MAX_MATCH_LIMIT = 12
+MAX_SCORE_LOOKBACK = 1
+DEFAULT_SCORE_LOOKBACK = MAX_SCORE_LOOKBACK
+DEFAULT_STREAK_HISTORY_PAGES = 1
+DEFAULT_MATCH_CONCURRENCY = 12
+
+def match_hero_usage(data: Dict[str, Any], source_match: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Heroes the queried player used in a match, most played first, with their share of match time.
+
+    The detail payload's ``heroList`` carries per-hero time; without it, fall back to the
+    match list's main hero.
+    """
+    heroes: List[Dict[str, Any]] = []
+    game_time = _safe_float((data or {}).get("gameTimeSec"))
+    for item in (data or {}).get("heroList") or []:
+        if not isinstance(item, dict):
+            continue
+        hero_guid = str(item.get("heroId") or item.get("heroGuid") or "").strip()
+        if not hero_guid:
+            continue
+        rate = _safe_float(item.get("useTimeRate"))
+        if rate <= 0 and game_time > 0:
+            rate = _safe_float(item.get("userTimeSec")) / game_time * 100
+        heroes.append({"hero_guid": hero_guid, "time_rate": round(max(0.0, min(100.0, rate)), 1)})
+    heroes.sort(key=lambda hero: hero["time_rate"], reverse=True)
+    if not heroes:
+        fallback = str((source_match or {}).get("heroGuid") or "").strip()
+        if fallback:
+            heroes.append({"hero_guid": fallback, "time_rate": 100.0})
+    return heroes[:3]
+
+
+def normalize_limit(value: Any) -> int:
+    try:
+        limit = int(value or DEFAULT_MATCH_LIMIT)
+    except (TypeError, ValueError):
+        limit = DEFAULT_MATCH_LIMIT
+    return max(MIN_MATCH_LIMIT, min(MAX_MATCH_LIMIT, limit))
+
+
+def normalize_role_type(role_type: Any) -> str:
+    normalized = str(role_type or "").strip().lower()
+    if normalized == "support":
+        return "healer"
+    return normalized
+
+
+def convert_rank_score(score: Any) -> Optional[int]:
+    return raw_rank_score_to_strength(score)
+
+
+def score_to_rank(score: Any) -> str:
+    return strength_score_to_rank(score)
+
+
+def jitter_scores(scores: Sequence[Any], y_offset_step: int = 60) -> List[float]:
+    valid_scores: List[int] = []
+    for value in scores or []:
+        try:
+            score_num = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        if score_num <= 0:
+            continue
+        valid_scores.append(score_num)
+
+    valid_scores.sort()
+    adjusted_scores: List[float] = []
+    count_map: Dict[int, int] = {}
+    for score_num in valid_scores:
+        repeated_count = count_map.get(score_num, 0)
+        adjusted_scores.append(float(score_num + repeated_count * y_offset_step))
+        count_map[score_num] = repeated_count + 1
+    return adjusted_scores
+
+
+def calculate_pre_match_streak(history: Sequence[Dict[str, Any]], target_match_id: str) -> int:
+    if not history or not target_match_id:
+        return 0
+
+    index = None
+    for idx, match in enumerate(history):
+        if str(match.get("matchId") or "") == str(target_match_id):
+            index = idx
+            break
+    if index is None:
+        return 0
+
+    older_matches = list(history[index + 1 :])
+    if not older_matches:
+        return 0
+
+    streak = 0
+    last_result: Optional[int] = None
+    for match in older_matches:
+        try:
+            result = int(match.get("matchRet"))
+        except (TypeError, ValueError):
+            break
+        if result == 1:
+            if last_result in (1, None):
+                streak += 1
+                last_result = 1
+                continue
+            break
+        if result == -1:
+            if last_result in (-1, None):
+                streak -= 1
+                last_result = -1
+                continue
+            break
+        break
+    return streak
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _range_dict(scores: Iterable[Any]) -> Dict[str, int]:
+    values: List[int] = []
+    for value in scores:
+        try:
+            score_num = int(value)
+        except (TypeError, ValueError):
+            continue
+        if score_num > 0:
+            values.append(score_num)
+    if not values:
+        return {"min": 0, "max": 0}
+    return {"min": min(values), "max": max(values)}
+
+
+def _get_season_payload(
+    recent_payloads: Sequence[tuple[int, List[Dict[str, Any]]]],
+    target_season: int,
+) -> List[Dict[str, Any]]:
+    for season_num, guide_count_data in recent_payloads:
+        if int(season_num) == int(target_season):
+            return list(guide_count_data or [])
+    return []
+
+
+def _build_player_competitive_meta(
+    recent_payloads: Sequence[tuple[int, List[Dict[str, Any]]]],
+    *,
+    live_season: int,
+) -> Dict[str, Any]:
+    latest_role_scores: Dict[str, int] = {}
+    latest_role_seasons: Dict[str, int] = {}
+    current_role_scores: Dict[str, int] = {}
+
+    current_payload = _get_season_payload(recent_payloads, live_season)
+    for row in current_payload:
+        if not isinstance(row, dict):
+            continue
+        role_type = normalize_role_type(row.get("roleType"))
+        score = convert_rank_score(get_rank_score(row.get("lastRankInfo") or row.get("last_rank_info") or {}))
+        if role_type and score is not None:
+            current_role_scores[role_type] = score
+
+    for season_num, guide_count_data in recent_payloads:
+        for row in guide_count_data:
+            if not isinstance(row, dict):
+                continue
+            role_type = normalize_role_type(row.get("roleType"))
+            if not role_type or role_type in latest_role_scores:
+                continue
+            score = convert_rank_score(get_rank_score(row.get("lastRankInfo") or row.get("last_rank_info") or {}))
+            if score is None:
+                continue
+            latest_role_scores[role_type] = score
+            latest_role_seasons[role_type] = int(season_num)
+
+    return {
+        "recent_payloads": list(recent_payloads),
+        "latest_role_scores": latest_role_scores,
+        "latest_role_seasons": latest_role_seasons,
+        "current_role_scores": current_role_scores,
+    }
+
+
+# Legacy helper — kept for backward compatibility.
+# Prefer _build_player_competitive_meta_from_records() for DB-cache paths
+# so that current_role_scores is correctly filtered by season.
+def _build_player_competitive_meta_from_scores(
+    scores_by_role: Dict[str, int],
+    *,
+    live_season: int,
+) -> Dict[str, Any]:
+    normalized_scores = {
+        normalize_role_type(role): int(score)
+        for role, score in (scores_by_role or {}).items()
+        if normalize_role_type(role) and int(score or 0) > 0
+    }
+    return {
+        "recent_payloads": [],
+        "latest_role_scores": dict(normalized_scores),
+        "latest_role_seasons": {role: int(live_season) for role in normalized_scores},
+        "current_role_scores": dict(normalized_scores),
+    }
+
+
+def _build_player_competitive_meta_from_records(
+    records_by_role: Dict[str, Dict[str, Any]],
+    *,
+    live_season: int,
+) -> Dict[str, Any]:
+    """Build competitive meta from DB records with season awareness.
+
+    Unlike _build_player_competitive_meta_from_scores, this function receives
+    the full record dict (including ``season``) per role, enabling it to
+    correctly separate *current-season* scores from *latest-available* scores
+    — aligning the DB-cache path with the API path semantics.
+
+    Records with ``season = NULL`` are treated as current-season data
+    (lenient strategy for legacy records; natural cache refresh fixes them).
+    """
+    latest_role_scores: Dict[str, int] = {}
+    latest_role_seasons: Dict[str, int] = {}
+    current_role_scores: Dict[str, int] = {}
+
+    for role, record in (records_by_role or {}).items():
+        normalized_role = normalize_role_type(role)
+        if not normalized_role:
+            continue
+        # Backward-compatible: accept both dict records and plain int scores
+        if isinstance(record, dict):
+            score = int(record.get("rank_score") or 0)
+            raw_season = record.get("season")
+            season_int = int(raw_season) if raw_season is not None else None
+        else:
+            score = int(record or 0)
+            season_int = None
+        if score <= 0:
+            continue
+
+        # latest: always populated if score > 0
+        latest_role_scores[normalized_role] = score
+        latest_role_seasons[normalized_role] = season_int if season_int is not None else live_season
+
+        # current: only if season matches live_season, or season is NULL (legacy grace)
+        if season_int is None or season_int == live_season:
+            current_role_scores[normalized_role] = score
+
+    return {
+        "recent_payloads": [],
+        "latest_role_scores": latest_role_scores,
+        "latest_role_seasons": latest_role_seasons,
+        "current_role_scores": current_role_scores,
+    }
+
+
+def _rank_records_from_payloads(
+    recent_payloads: Sequence[tuple[int, List[Dict[str, Any]]]],
+    *,
+    player_bnet_id: str,
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    seen_roles: set[str] = set()
+    for season_num, guide_count_data in recent_payloads or []:
+        for row in guide_count_data or []:
+            if not isinstance(row, dict):
+                continue
+            role_type = normalize_role_type(row.get("roleType"))
+            if not role_type or role_type in seen_roles:
+                continue
+            score = convert_rank_score((row.get("lastRankInfo") or {}).get("rankScore"))
+            if score is None:
+                continue
+            seen_roles.add(role_type)
+            records.append(
+                {
+                    "player_bnet_id": player_bnet_id,
+                    "role_type": role_type,
+                    "rank_score": score,
+                    "season": int(season_num),
+                    "source_match_id": "",
+                }
+            )
+    return records
+
+
+class DashenQuickStrengthEngine:
+    def __init__(
+        self,
+        requests: DashenQuickStrengthRequests,
+        *,
+        score_lookback: int = DEFAULT_SCORE_LOOKBACK,
+        streak_history_pages: int = DEFAULT_STREAK_HISTORY_PAGES,
+        match_concurrency: int = DEFAULT_MATCH_CONCURRENCY,
+    ) -> None:
+        self.requests = requests
+        self.score_lookback = max(0, min(MAX_SCORE_LOOKBACK, int(score_lookback)))
+        self.streak_history_pages = max(1, int(streak_history_pages))
+        self.match_concurrency = max(1, int(match_concurrency))
+
+    async def build(
+        self,
+        *,
+        customer_token: str,
+        bnet_id: str = "",
+        limit: int,
+        include_previous_season: bool,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        trace_id = uuid.uuid4().hex[:8]
+
+        @contextmanager
+        def stage(name: str):
+            started = time.monotonic()
+            print(f"[overstats] quick-strength trace={trace_id} stage={name} start", flush=True)
+            try:
+                yield
+            finally:
+                elapsed = time.monotonic() - started
+                print(
+                    f"[overstats] quick-strength trace={trace_id} stage={name} elapsed_s={elapsed:.3f}",
+                    flush=True,
+                )
+
+        match_limit = normalize_limit(limit)
+        live_season = int(get_live_dashen_season())
+        with stage("recent_matches"):
+            recent_matches = await self.requests.list_recent_quick_matches(
+                customer_token,
+                limit=match_limit,
+                include_previous_season=include_previous_season,
+            )
+        if not recent_matches:
+            return {
+                "summary": {
+                    "match_count": 0,
+                    "overall_avg_score": 0.0,
+                    "overall_avg_rank": "Unranked",
+                    "score_range": {"min": 0, "max": 0},
+                    "used_previous_season_fallback": False,
+                    "personal_data_exceeded_percent": None,
+                    "personal_data_top_percent": None,
+                    "personal_data_metric_count": 0,
+                },
+                "matches": [],
+            }
+
+        hero_role_map = self._build_hero_role_map(config)
+        match_detail_cache: Dict[str, Dict[str, Any]] = {}
+        match_detail_tasks: Dict[str, asyncio.Task[Dict[str, Any]]] = {}
+        rank_db = IDPoolDB()
+        rank_cache_week = current_cache_week()
+        player_rank_records: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        player_rank_markers: set[str] = set()
+        player_competitive_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+        semaphore = asyncio.Semaphore(self.match_concurrency)
+
+        async def get_match_detail(match_id: str) -> Dict[str, Any]:
+            cache_key = str(match_id or "")
+            if cache_key in match_detail_cache:
+                return match_detail_cache[cache_key]
+            task = match_detail_tasks.get(cache_key)
+            if task is None:
+                task = asyncio.create_task(self.requests.get_match_detail(customer_token, cache_key))
+                match_detail_tasks[cache_key] = task
+            try:
+                match_detail_cache[cache_key] = await task
+            finally:
+                match_detail_tasks.pop(cache_key, None)
+            return match_detail_cache[cache_key]
+
+        async def get_player_competitive_meta(player_token: str, role_type: str, player_bnet_id: str = "") -> Dict[str, Any]:
+            normalized_bnet = str(player_bnet_id or "").strip()
+            cache_subject = normalized_bnet or str(player_token or "")
+            cache_key = (cache_subject, normalize_role_type(role_type))
+            if cache_key in player_competitive_cache:
+                return player_competitive_cache[cache_key]
+
+            if normalized_bnet:
+                if normalized_bnet not in player_rank_records:
+                    records = await asyncio.to_thread(
+                        rank_db.get_player_competitive_rank_records,
+                        [normalized_bnet],
+                        cache_week=rank_cache_week,
+                    )
+                    player_rank_records.update(records)
+                cached_roles = player_rank_records.get(normalized_bnet) or {}
+                if cached_roles:
+                    filtered_records = {
+                        role: record
+                        for role, record in cached_roles.items()
+                        if int((record.get("rank_score") or 0)) > 0
+                    }
+                    player_competitive_cache[cache_key] = _build_player_competitive_meta_from_records(
+                        filtered_records,
+                        live_season=live_season,
+                    )
+                    return player_competitive_cache[cache_key]
+
+                if normalized_bnet not in player_rank_markers:
+                    markers = await asyncio.to_thread(
+                        rank_db.get_player_competitive_rank_fetch_markers,
+                        [normalized_bnet],
+                        cache_week=rank_cache_week,
+                        game_mode="sport",
+                    )
+                    player_rank_markers.update(markers)
+                if normalized_bnet in player_rank_markers:
+                    player_competitive_cache[cache_key] = _build_player_competitive_meta_from_records(
+                        {},
+                        live_season=live_season,
+                    )
+                    return player_competitive_cache[cache_key]
+
+            async def _load_competitive_meta() -> Dict[str, Any]:
+                recent_payloads = await self.requests.list_recent_competitive_payloads(
+                    str(player_token or ""),
+                    current_season=live_season,
+                    max_lookback=self.score_lookback,
+                    required_role=cache_key[1],
+                )
+                if normalized_bnet:
+                    records = _rank_records_from_payloads(recent_payloads, player_bnet_id=normalized_bnet)
+                    await asyncio.to_thread(
+                        rank_db.upsert_player_competitive_rank_snapshot,
+                        normalized_bnet,
+                        cache_week=rank_cache_week,
+                        game_mode="sport",
+                        role_rank_records=records,
+                        checked_at=int(time.time()),
+                    )
+                    player_rank_markers.add(normalized_bnet)
+                    player_rank_records[normalized_bnet] = {
+                        str(record.get("role_type") or ""): {
+                            "rank_score": int(record.get("rank_score") or 0),
+                            "season": record.get("season"),
+                            "cache_week": rank_cache_week,
+                        }
+                        for record in records
+                    }
+                return _build_player_competitive_meta(
+                    recent_payloads,
+                    live_season=live_season,
+                )
+
+            if normalized_bnet:
+                player_competitive_cache[cache_key] = await rank_singleflight.do(
+                    ("rank", rank_cache_week, normalized_bnet),
+                    _load_competitive_meta,
+                )
+            else:
+                player_competitive_cache[cache_key] = await _load_competitive_meta()
+            return player_competitive_cache[cache_key]
+
+        async def build_one(source_match: Dict[str, Any]) -> Dict[str, Any]:
+            async with semaphore:
+                return await self._build_match_point(
+                    source_match=source_match,
+                    live_season=live_season,
+                    hero_role_map=hero_role_map,
+                    get_match_detail=get_match_detail,
+                    get_player_competitive_meta=get_player_competitive_meta,
+                )
+
+        with stage("match_details_and_player_ranks"):
+            results = await asyncio.gather(*(build_one(match) for match in recent_matches), return_exceptions=True)
+
+        match_points_desc: List[Dict[str, Any]] = []
+        used_previous_fallback = False
+        for source_match, result in zip(recent_matches, results):
+            if isinstance(result, Exception) or not isinstance(result, dict):
+                point = self._empty_match_point(source_match)
+            else:
+                point = result
+            logical_season = _safe_int(source_match.get("_dashenSeason"))
+            if logical_season and logical_season < live_season:
+                point["_used_previous_season_fallback"] = True
+            if bool(point.get("_used_previous_season_fallback")):
+                used_previous_fallback = True
+            match_points_desc.append(point)
+
+        match_points = list(reversed(match_points_desc))
+        valid_avg_scores = [
+            _safe_float(point.get("avg_score"))
+            for point in match_points
+            if _safe_float(point.get("avg_score")) > 0
+        ]
+        summary_score_range = _range_dict(int(round(score)) for score in valid_avg_scores)
+        overall_avg_score = round(sum(valid_avg_scores) / len(valid_avg_scores), 1) if valid_avg_scores else 0.0
+
+        for point in match_points:
+            point.pop("_used_previous_season_fallback", None)
+
+        return {
+            "summary": {
+                "match_count": len(match_points),
+                "overall_avg_score": overall_avg_score,
+                "overall_avg_rank": score_to_rank(overall_avg_score) if overall_avg_score > 0 else "Unranked",
+                "score_range": summary_score_range,
+                "used_previous_season_fallback": used_previous_fallback,
+                # Keep response fields compatible; population percentiles are disabled.
+                "personal_data_exceeded_percent": None,
+                "personal_data_top_percent": None,
+                "personal_data_metric_count": 0,
+            },
+            "matches": match_points,
+        }
+
+    async def _build_match_point(
+        self,
+        *,
+        source_match: Dict[str, Any],
+        live_season: int,
+        hero_role_map: Dict[str, str],
+        get_match_detail: Any,
+        get_player_competitive_meta: Any,
+    ) -> Dict[str, Any]:
+        match_id = str(source_match.get("matchId") or "")
+        detail_payload = await get_match_detail(match_id)
+        if not isinstance(detail_payload, dict) or detail_payload.get("code") != 0:
+            return self._empty_match_point(source_match)
+
+        data = detail_payload.get("data") if isinstance(detail_payload.get("data"), dict) else {}
+        participants: List[Dict[str, Any]] = []
+        for team_key, side in (("teammateList", "team"), ("enemyList", "enemy")):
+            for player in data.get(team_key, []) or []:
+                if not isinstance(player, dict):
+                    continue
+                player_token = str(player.get("customerToken") or "").strip()
+                if not player_token:
+                    continue
+                hero_guid = str(player.get("heroGuid") or "").strip()
+                role_type = hero_role_map.get(hero_guid) or normalize_role_type(player.get("roleType"))
+                if not role_type:
+                    continue
+                bnet_id = str(player.get("bnetId") or "").strip()
+                participants.append(
+                    {
+                        "side": side,
+                        "player_token": player_token,
+                        "role_type": role_type,
+                        "bnet_id": bnet_id,
+                    }
+                )
+
+        if not participants:
+            return self._empty_match_point(source_match)
+
+        meta_results = await asyncio.gather(
+            *(
+                get_player_competitive_meta(
+                    item["player_token"],
+                    item["role_type"],
+                    item.get("bnet_id", ""),
+                )
+                for item in participants
+            ),
+            return_exceptions=True,
+        )
+        team_scores: List[int] = []
+        enemy_scores: List[int] = []
+        latest_role_scores: List[int] = []
+        latest_all_role_scores: List[int] = []
+        current_role_scores: List[int] = []
+        current_all_role_scores: List[int] = []
+        used_previous_fallback = False
+
+        for participant, player_meta in zip(participants, meta_results):
+            if isinstance(player_meta, Exception) or not isinstance(player_meta, dict):
+                continue
+
+            role_type = participant["role_type"]
+            score_bucket = team_scores if participant["side"] == "team" else enemy_scores
+
+            latest_score = player_meta.get("latest_role_scores", {}).get(role_type)
+            latest_season = player_meta.get("latest_role_seasons", {}).get(role_type)
+            if isinstance(latest_score, int) and latest_score > 0:
+                latest_role_scores.append(latest_score)
+                score_bucket.append(latest_score)
+                if latest_season is not None and int(latest_season) < live_season:
+                    used_previous_fallback = True
+
+            all_role_scores = [
+                int(score)
+                for score in player_meta.get("latest_role_scores", {}).values()
+                if isinstance(score, int) and score > 0
+            ]
+            latest_all_role_scores.extend(all_role_scores)
+            if any(
+                int(season_num) < live_season
+                for season_num in player_meta.get("latest_role_seasons", {}).values()
+            ):
+                used_previous_fallback = True
+
+            current_score = player_meta.get("current_role_scores", {}).get(role_type)
+            if isinstance(current_score, int) and current_score > 0:
+                current_role_scores.append(current_score)
+
+            current_all_scores = [
+                int(score)
+                for score in player_meta.get("current_role_scores", {}).values()
+                if isinstance(score, int) and score > 0
+            ]
+            current_all_role_scores.extend(current_all_scores)
+
+        avg_score = round(sum(latest_role_scores) / len(latest_role_scores), 1) if latest_role_scores else 0.0
+
+        return {
+            "match_id": match_id,
+            "begin_ts": _safe_int(source_match.get("beginTs")),
+            "result": _safe_int(data.get("matchRet", source_match.get("matchRet"))),
+            "map_guid": str(source_match.get("mapGuid") or data.get("mapGuid") or ""),
+            "avg_score": avg_score,
+            "avg_rank": score_to_rank(avg_score) if avg_score > 0 else "Unranked",
+            "role_range": _range_dict(latest_role_scores),
+            "all_role_range": _range_dict(latest_all_role_scores),
+            "current_role_range": _range_dict(current_role_scores),
+            "current_all_role_range": _range_dict(current_all_role_scores),
+            "team_scores": list(team_scores),
+            "enemy_scores": list(enemy_scores),
+            # Temporarily disabled to avoid extra quick-history fanout.
+            "team_streak_avg": 0.0,
+            "enemy_streak_avg": 0.0,
+            "heroes": match_hero_usage(data, source_match),
+            "_used_previous_season_fallback": used_previous_fallback,
+        }
+
+    def _build_hero_role_map(self, config: Dict[str, Any]) -> Dict[str, str]:
+        role_map: Dict[str, str] = {}
+        for hero in config.get("heroList", []) or []:
+            if not isinstance(hero, dict):
+                continue
+            hero_guid = str(
+                hero.get("heroGuid")
+                or hero.get("heroId")
+                or hero.get("guid")
+                or hero.get("id")
+                or ""
+            ).strip()
+            if not hero_guid:
+                continue
+            role_type = normalize_role_type(hero.get("roleType"))
+            if role_type:
+                role_map[hero_guid] = role_type
+        return role_map
+
+    def _empty_match_point(self, source_match: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "match_id": str(source_match.get("matchId") or ""),
+            "begin_ts": _safe_int(source_match.get("beginTs")),
+            "result": _safe_int(source_match.get("matchRet")),
+            "map_guid": str(source_match.get("mapGuid") or ""),
+            "avg_score": 0.0,
+            "avg_rank": "Unranked",
+            "role_range": {"min": 0, "max": 0},
+            "all_role_range": {"min": 0, "max": 0},
+            "current_role_range": {"min": 0, "max": 0},
+            "current_all_role_range": {"min": 0, "max": 0},
+            "team_scores": [],
+            "enemy_scores": [],
+            "team_streak_avg": 0.0,
+            "enemy_streak_avg": 0.0,
+            "heroes": match_hero_usage({}, source_match),
+            "_used_previous_season_fallback": False,
+        }

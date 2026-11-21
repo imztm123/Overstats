@@ -1,0 +1,814 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Tuple
+
+
+@dataclass(frozen=True)
+class HTTPUIFieldOption:
+    value: str
+    label: str
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "value": self.value,
+            "label": self.label,
+        }
+
+
+@dataclass(frozen=True)
+class HTTPUIFieldSpec:
+    id: str
+    label: str
+    payload_key: str
+    control_type: str = "text"
+    placeholder: str = ""
+    default: Any = ""
+    help_text: str = ""
+    options: Tuple[HTTPUIFieldOption, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "payload_key": self.payload_key,
+            "control_type": self.control_type,
+            "placeholder": self.placeholder,
+            "default": self.default,
+            "help_text": self.help_text,
+            "options": [item.to_dict() for item in self.options],
+        }
+
+
+@dataclass(frozen=True)
+class HTTPUIModuleSpec:
+    id: str
+    title: str
+    description: str
+    json_endpoint: str
+    image_endpoint: str
+    requires_target: bool = True
+    default_target_key: str = "bnet_id"
+    fields: Tuple[HTTPUIFieldSpec, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "description": self.description,
+            "json_endpoint": self.json_endpoint,
+            "image_endpoint": self.image_endpoint,
+            "requires_target": self.requires_target,
+            "default_target_key": self.default_target_key,
+            "fields": [item.to_dict() for item in self.fields],
+        }
+
+
+def _bool_field(field_id: str, label: str, payload_key: str, *, default: bool, help_text: str = "") -> HTTPUIFieldSpec:
+    return HTTPUIFieldSpec(
+        id=field_id,
+        label=label,
+        payload_key=payload_key,
+        control_type="checkbox",
+        default=bool(default),
+        help_text=help_text,
+    )
+
+
+def _number_field(
+    field_id: str,
+    label: str,
+    payload_key: str,
+    *,
+    placeholder: str = "",
+    default: str = "",
+    help_text: str = "",
+) -> HTTPUIFieldSpec:
+    return HTTPUIFieldSpec(
+        id=field_id,
+        label=label,
+        payload_key=payload_key,
+        control_type="number",
+        placeholder=placeholder,
+        default=default,
+        help_text=help_text,
+    )
+
+
+def _select_field(
+    field_id: str,
+    label: str,
+    payload_key: str,
+    *,
+    default: str,
+    help_text: str = "",
+    options: Tuple[HTTPUIFieldOption, ...],
+) -> HTTPUIFieldSpec:
+    return HTTPUIFieldSpec(
+        id=field_id,
+        label=label,
+        payload_key=payload_key,
+        control_type="select",
+        default=default,
+        help_text=help_text,
+        options=options,
+    )
+
+
+HTTP_UI_MODULE_SPECS: Tuple[HTTPUIModuleSpec, ...] = (
+    HTTPUIModuleSpec(
+        id="dashen-profile",
+        title="玩家资料",
+        description="查看基础生涯资料，支持 JSON 或图片卡片。",
+        json_endpoint="/api/v2/dashen-profile",
+        image_endpoint="/api/v2/dashen-profile/image",
+        fields=(
+            _number_field("season", "赛季", "season", placeholder="留空为当前赛季"),
+            _bool_field(
+                "include_previous_season",
+                "允许回退上赛季",
+                "include_previous_season",
+                default=True,
+            ),
+            _select_field(
+                "profile_mode",
+                "资料模式",
+                "mode",
+                default="quick",
+                options=(
+                    HTTPUIFieldOption("quick", "快速"),
+                    HTTPUIFieldOption("competitive", "竞技"),
+                ),
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="career-compare", title="生涯对比",
+        description="小程序生涯累计：同英雄详细数据与六维雷达，留空英雄时比较双方合计时长前三。",
+        json_endpoint="/api/v2/career-compare", image_endpoint="/api/v2/career-compare/image", requires_target=False,
+        fields=(
+            HTTPUIFieldSpec("career_player1", "玩家一", "player1", placeholder="完整战网名称或九位数字 ID"),
+            HTTPUIFieldSpec("career_player2", "玩家二（可选）", "player2", placeholder="留空对比全服 Top 20%"),
+            HTTPUIFieldSpec("career_hero", "英雄（可选）", "hero", placeholder="例如：安娜"),
+            HTTPUIFieldSpec("career_xcxtoken", "小程序 xcxtoken", "xcxtoken", control_type="password", help_text="仅用于本次小程序请求"),
+            _select_field("career_mode", "模式", "mode", default="quick", options=(
+                HTTPUIFieldOption("quick", "快速"), HTTPUIFieldOption("competitive", "竞技"),
+                HTTPUIFieldOption("stadium_quick", "角斗快速"), HTTPUIFieldOption("stadium_competitive", "角斗竞技"),
+            )),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-hero-compare", title="英雄对比",
+        description="比较两名玩家的前三英雄或指定英雄，无数据依次回查前三赛季。",
+        json_endpoint="/api/v2/dashen-hero-compare", image_endpoint="/api/v2/dashen-hero-compare/image", requires_target=False,
+        fields=(
+            HTTPUIFieldSpec("compare_player1", "玩家一", "player1", placeholder="Player#12345"),
+            HTTPUIFieldSpec("compare_player2", "玩家二", "player2", placeholder="Player#67890"),
+            HTTPUIFieldSpec("compare_hero", "英雄（可选）", "hero", placeholder="安娜"),
+            _select_field("compare_mode", "模式", "mode", default="quick", options=(HTTPUIFieldOption("quick","快速"),HTTPUIFieldOption("competitive","竞技"),HTTPUIFieldOption("open","开放"),HTTPUIFieldOption("competitive_open","开放竞技"))),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-hero-treemap",
+        title="英雄云图",
+        description="按英雄游玩时长生成胜率大盘云图，支持 JSON 或图片输出。",
+        json_endpoint="/api/v2/dashen-hero-treemap",
+        image_endpoint="/api/v2/dashen-hero-treemap/image",
+        fields=(
+            _number_field("season", "赛季", "season", placeholder="留空为当前赛季"),
+            _bool_field(
+                "include_previous_season",
+                "允许回退上赛季",
+                "include_previous_season",
+                default=True,
+            ),
+            _select_field(
+                "treemap_mode",
+                "数据模式",
+                "mode",
+                default="quick",
+                options=(
+                    HTTPUIFieldOption("competitive", "竞技 5v5"),
+                    HTTPUIFieldOption("quick", "快速 5v5"),
+                    HTTPUIFieldOption("quick6v6", "快速 6v6"),
+                    HTTPUIFieldOption("competitive6v6", "竞技 6v6"),
+                    HTTPUIFieldOption("open", "快速开放"),
+                    HTTPUIFieldOption("competitive_open", "开放竞技"),
+                ),
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-match",
+        title="近期对局",
+        description="普通查询获取近期对局；填写地图或英雄后，检索最近两个赛季最多20场。",
+        json_endpoint="/api/v2/dashen-match",
+        image_endpoint="/api/v2/dashen-match/image",
+        fields=(
+            HTTPUIFieldSpec("map", "地图", "map", placeholder="可选，如国王大道、尼泊尔"),
+            HTTPUIFieldSpec("hero", "英雄", "hero", placeholder="可选，支持英雄别名"),
+            _number_field("limit", "数量", "limit", placeholder="默认 20", default="20"),
+            _bool_field("include_fight", "包含角斗领域", "include_fight", default=True),
+            _bool_field(
+                "include_previous_season",
+                "允许回退上赛季",
+                "include_previous_season",
+                default=True,
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-match-detail",
+        title="单局对局详情",
+        description="查看单局主面板、详细信息和 AI 总结，JSON 回复会直接在 HTML 中展开。",
+        json_endpoint="/api/v2/dashen-match/detail/replies",
+        image_endpoint="/api/v2/dashen-match/detail/image",
+        fields=(
+            _number_field(
+                "index",
+                "对局索引",
+                "index",
+                placeholder="默认 0",
+                default="0",
+                help_text="从近期对局列表按 0 开始取值。",
+            ),
+            _number_field(
+                "limit",
+                "回溯数量",
+                "limit",
+                placeholder="默认 20",
+                default="20",
+                help_text="先拉取多少场近期对局，再按索引定位单局。",
+            ),
+            _bool_field("include_fight", "包含角斗领域", "include_fight", default=True),
+            _bool_field(
+                "include_previous_season",
+                "允许回退上赛季",
+                "include_previous_season",
+                default=True,
+            ),
+            _bool_field(
+                "show_all_heroes",
+                "展示详细信息",
+                "show_all_heroes",
+                default=True,
+                help_text="开启后展示全员详细；关闭时仅展示当前玩家英雄详情。",
+            ),
+            _bool_field(
+                "analyze",
+                "生成 AI 总结",
+                "analyze",
+                default=True,
+                help_text="开启后会追加 AI 总结卡片，耗时会更长。",
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-sameplay",
+        title="同玩查询",
+        description="查看两位玩家近两赛季的共同快速/竞技对局。",
+        json_endpoint="/api/v2/dashen-sameplay",
+        image_endpoint="/api/v2/dashen-sameplay/image",
+        requires_target=False,
+        fields=(
+            HTTPUIFieldSpec(
+                id="player1_bnet_id",
+                label="玩家1",
+                payload_key="player1_bnet_id",
+                placeholder="BattleTag 或 token 请直接写在 raw JSON",
+            ),
+            HTTPUIFieldSpec(
+                id="player2_bnet_id",
+                label="玩家2",
+                payload_key="player2_bnet_id",
+                placeholder="BattleTag 或 token 请直接写在 raw JSON",
+            ),
+            _number_field("limit", "数量", "limit", placeholder="默认 20", default="20"),
+            _bool_field(
+                "include_previous_season",
+                "允许回退上赛季",
+                "include_previous_season",
+                default=True,
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-sameplay-detail",
+        title="同玩详情",
+        description="查看同玩某场对局的主战绩、双人英雄详情、全员详细和 AI 锐评。",
+        json_endpoint="/api/v2/dashen-sameplay/detail/replies",
+        image_endpoint="/api/v2/dashen-sameplay/detail/image",
+        requires_target=False,
+        fields=(
+            HTTPUIFieldSpec(
+                id="player1_bnet_id",
+                label="玩家1",
+                payload_key="player1_bnet_id",
+                placeholder="BattleTag 或 token 请直接写在 raw JSON",
+            ),
+            HTTPUIFieldSpec(
+                id="player2_bnet_id",
+                label="玩家2",
+                payload_key="player2_bnet_id",
+                placeholder="BattleTag 或 token 请直接写在 raw JSON",
+            ),
+            _number_field(
+                "index",
+                "对局索引",
+                "index",
+                placeholder="默认 0",
+                default="0",
+                help_text="从同玩列表按 0 开始取值。",
+            ),
+            HTTPUIFieldSpec(
+                id="match_id",
+                label="match_id",
+                payload_key="match_id",
+                placeholder="可选，与 index 二选一",
+            ),
+            _number_field("limit", "回溯数量", "limit", placeholder="默认 20", default="20"),
+            _bool_field(
+                "include_previous_season",
+                "允许回退上赛季",
+                "include_previous_season",
+                default=True,
+            ),
+            _bool_field(
+                "show_all_heroes",
+                "展示全员详细",
+                "show_all_heroes",
+                default=False,
+            ),
+            _bool_field(
+                "analyze",
+                "生成 AI 锐评",
+                "analyze",
+                default=False,
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-team-overview",
+        title="双方概览",
+        description="导入玩家 Base64，上排队友、下排对手，展示常用三英雄、当前段位与省级排行榜。",
+        json_endpoint="/api/v2/dashen-team-overview",
+        image_endpoint="/api/v2/dashen-team-overview/image",
+        requires_target=False,
+        fields=(HTTPUIFieldSpec(
+            id="base64", label="玩家列表 Base64", payload_key="base64", control_type="textarea",
+            placeholder="粘贴导出器生成的 Base64",
+            help_text="需要含队友/对手标记的版本 2 数据；不支持旧版纯 ID 数组。",
+        ),),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-rank-history",
+        title="段位历史",
+        description="查看赛季段位变化，支持 JSON 或图片。",
+        json_endpoint="/api/v2/dashen-rank-history",
+        image_endpoint="/api/v2/dashen-rank-history/image",
+        fields=(
+            _number_field("start_season", "开始赛季", "start_season", placeholder="自动"),
+            _number_field("end_season", "结束赛季", "end_season", placeholder="自动"),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-quick-strength",
+        title="快速强度",
+        description="估算快速模式强度，支持 JSON 或图片。",
+        json_endpoint="/api/v2/dashen-quick-strength",
+        image_endpoint="/api/v2/dashen-quick-strength/image",
+        fields=(
+            _number_field("limit", "数量", "limit", placeholder="3-12", default="12"),
+            _bool_field(
+                "include_previous_season",
+                "允许回退上赛季",
+                "include_previous_season",
+                default=True,
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-competitive-strength",
+        title="竞技强度",
+        description="估算竞技模式强度，支持 JSON 或图片。",
+        json_endpoint="/api/v2/dashen-competitive-strength",
+        image_endpoint="/api/v2/dashen-competitive-strength/image",
+        fields=(
+            _number_field("limit", "数量", "limit", placeholder="3-12", default="12"),
+            _bool_field(
+                "include_previous_season",
+                "允许回退上赛季",
+                "include_previous_season",
+                default=True,
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-shiqu",
+        title="是区吗",
+        description="抓取近期预设/6v6 对局与队友数据，调用独立 LLM 生成脱口秀式毒舌判定书，支持 JSON 或图片。",
+        json_endpoint="/api/v2/dashen-shiqu",
+        image_endpoint="/api/v2/dashen-shiqu/image",
+        requires_target=True,
+        default_target_key="bnet_id",
+        fields=(
+            _number_field(
+                "match_count",
+                "对局数量",
+                "match_count",
+                placeholder="默认 12，范围 2-25",
+                default="12",
+                help_text="抓取最近多少场预设/6v6 对局用于判定。",
+            ),
+            _bool_field(
+                "use_db",
+                "复用数据库记录",
+                "use_db",
+                default=False,
+                help_text="开启后跳过 LLM，直接渲染数据库里该玩家最近一次判定。",
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-court",
+        title="电竞法庭",
+        description="基于单局对局详情，调用独立 LLM 输出毒舌判决书，支持 JSON 或图片。",
+        json_endpoint="/api/v2/dashen-court",
+        image_endpoint="/api/v2/dashen-court/image",
+        requires_target=True,
+        default_target_key="bnet_id",
+        fields=(
+            _number_field("index", "对局序号", "index", placeholder="0 = 最近一局", default="0"),
+            _bool_field(
+                "use_db",
+                "复用数据库记录",
+                "use_db",
+                default=False,
+                help_text="开启后跳过 LLM，直接渲染数据库里该玩家最近一次判决书。",
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-rank-leaderboard",
+        title="Dashen 排行榜",
+        description="查看 Dashen 省榜，按职责返回 JSON 或榜单图。",
+        json_endpoint="/api/v2/dashen-rank-leaderboard",
+        image_endpoint="/api/v2/dashen-rank-leaderboard/image",
+        requires_target=False,
+        fields=(
+            HTTPUIFieldSpec(
+                id="province",
+                label="地区",
+                payload_key="province",
+                placeholder="例如：北京",
+            ),
+            _select_field(
+                "role",
+                "职责",
+                "role",
+                default="tank",
+                options=(
+                    HTTPUIFieldOption("tank", "重装"),
+                    HTTPUIFieldOption("dps", "输出"),
+                    HTTPUIFieldOption("healer", "支援"),
+                    HTTPUIFieldOption("open", "开放"),
+                ),
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-hero-leaderboard",
+        title="Dashen 英雄榜",
+        description="查看 Dashen 省榜英雄排名，支持 JSON 或榜单图。",
+        json_endpoint="/api/v2/dashen-hero-leaderboard",
+        image_endpoint="/api/v2/dashen-hero-leaderboard/image",
+        requires_target=False,
+        fields=(
+            HTTPUIFieldSpec(
+                id="province",
+                label="地区",
+                payload_key="province",
+                placeholder="例如：北京",
+            ),
+            HTTPUIFieldSpec(
+                id="hero",
+                label="英雄",
+                payload_key="hero",
+                placeholder="例如：猎空 / Tracer / heroGuid",
+            ),
+            _select_field(
+                "mode",
+                "队列",
+                "mode",
+                default="preset",
+                options=(
+                    HTTPUIFieldOption("preset", "预设"),
+                    HTTPUIFieldOption("open", "开放"),
+                ),
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="ow-hero-pick-rate",
+        title="英雄选取率",
+        description="查看全英雄最新选取率榜单，或查看单个英雄的历史选取率曲线。",
+        json_endpoint="/api/v2/ow-hero-pick-rate",
+        image_endpoint="/api/v2/ow-hero-pick-rate/image",
+        requires_target=False,
+        fields=(
+            _select_field(
+                "view",
+                "视图",
+                "view",
+                default="overview",
+                options=(
+                    HTTPUIFieldOption("overview", "全局概览"),
+                    HTTPUIFieldOption("ranking", "榜单"),
+                    HTTPUIFieldOption("history", "历史"),
+                ),
+            ),
+            _select_field(
+                "game_mode",
+                "模式",
+                "game_mode",
+                default="competitive",
+                options=(
+                    HTTPUIFieldOption("quick", "快速"),
+                    HTTPUIFieldOption("competitive", "竞技"),
+                ),
+            ),
+            _select_field(
+                "mmr",
+                "段位",
+                "mmr",
+                default="all",
+                options=(
+                    HTTPUIFieldOption("all", "全段位"),
+                    HTTPUIFieldOption("Bronze", "青铜"),
+                    HTTPUIFieldOption("Silver", "白银"),
+                    HTTPUIFieldOption("Gold", "黄金"),
+                    HTTPUIFieldOption("Platinum", "白金"),
+                    HTTPUIFieldOption("Emerald", "翡翠"),
+                    HTTPUIFieldOption("Diamond", "钻石"),
+                    HTTPUIFieldOption("Master", "大师"),
+                    HTTPUIFieldOption("Grandmaster", "宗师"),
+                    HTTPUIFieldOption("Champion", "英杰"),
+                ),
+            ),
+            HTTPUIFieldSpec(
+                id="hero",
+                label="英雄",
+                payload_key="hero",
+                placeholder="仅 history 视图使用，支持中文名或 heroGuid",
+                help_text="仅 history 视图使用。",
+            ),
+            _number_field(
+                "history_limit",
+                "历史天数（最多60天）",
+                "history_limit",
+                placeholder="默认 60，仅 history 视图使用",
+                default="60",
+                help_text="仅 history 视图使用。",
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="ow-hero-perk",
+        title="威能总览",
+        description="查看指定英雄的次级/主要威能总览，JSON 返回完整排序，图片展示每档前 2 项。",
+        json_endpoint="/api/v2/ow-hero-perk",
+        image_endpoint="/api/v2/ow-hero-perk/image",
+        requires_target=False,
+        fields=(
+            HTTPUIFieldSpec(
+                id="hero",
+                label="英雄",
+                payload_key="hero",
+                placeholder="例如：安娜 / Tracer / heroGuid",
+                help_text="支持中文名、常见别名和 heroGuid。",
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="ow-hero-wiki",
+        title="英雄百科",
+        description="查看英雄图文百科，检索技能数值、威能与机制，并附资料引用。",
+        json_endpoint="/api/v2/ow_hero_wiki",
+        image_endpoint="/api/v2/ow_hero_wiki/image",
+        requires_target=False,
+        fields=(
+            HTTPUIFieldSpec(
+                id="hero",
+                label="英雄",
+                payload_key="hero",
+                placeholder="例如：猎空 / Tracer / heroGuid",
+                help_text="支持中文名、英文名、常见别名，以及 hero?问题 的旧格式。",
+            ),
+            HTTPUIFieldSpec(
+                id="question",
+                label="问题",
+                payload_key="question",
+                placeholder="可选，例如：闪现最多有几层？",
+                help_text="留空查看完整百科；填写后优先展示回答、相关技能和来源。未配置模型时也可检索原文片段。",
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-summary-today",
+        title="今日总结",
+        description="生成今日总结；周总结会更慢一些。",
+        json_endpoint="/api/v2/dashen-summary/today",
+        image_endpoint="/api/v2/dashen-summary/today/image",
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-summary-yesterday",
+        title="昨日总结",
+        description="生成昨日总结。",
+        json_endpoint="/api/v2/dashen-summary/yesterday",
+        image_endpoint="/api/v2/dashen-summary/yesterday/image",
+    ),
+    HTTPUIModuleSpec(
+        id="dashen-summary-week",
+        title="本周总结",
+        description="生成一周总结；这是最慢的一项。",
+        json_endpoint="/api/v2/dashen-summary/week",
+        image_endpoint="/api/v2/dashen-summary/week/image",
+    ),
+    HTTPUIModuleSpec(
+        id="ow-esports",
+        title="OW 赛事",
+        description="查看当前 OW 赛事，不需要玩家目标。",
+        json_endpoint="/api/v2/ow-esports",
+        image_endpoint="/api/v2/ow-esports/image",
+        requires_target=False,
+        fields=(_select_field("esports_region", "赛区", "region", default="china", options=(
+            HTTPUIFieldOption("china", "中国"), HTTPUIFieldOption("world", "世界"),
+            HTTPUIFieldOption("korea", "韩国"), HTTPUIFieldOption("japan", "日本"),
+            HTTPUIFieldOption("north_america", "北美"), HTTPUIFieldOption("emea", "EMEA"),
+        )),),
+    ),
+    HTTPUIModuleSpec(
+        id="blizzard-player-search",
+        title="Blizzard Player Search",
+        description="Search public international Overwatch player profiles from Blizzard.",
+        json_endpoint="/api/v2/blizzard-player-search",
+        image_endpoint="",
+        requires_target=False,
+        fields=(
+            HTTPUIFieldSpec(
+                id="name",
+                label="Player",
+                payload_key="name",
+                placeholder="e.g. ABC or ABC#1234",
+            ),
+            HTTPUIFieldSpec(
+                id="blizzard_id",
+                label="Blizzard ID",
+                payload_key="blizzard_id",
+                placeholder="Optional exact-match resolver",
+            ),
+            HTTPUIFieldSpec(
+                id="locale",
+                label="Locale",
+                payload_key="locale",
+                placeholder="zh-tw / en-us",
+                default="zh-tw",
+            ),
+            _select_field(
+                "order_by",
+                "Sort",
+                "order_by",
+                default="name:asc",
+                options=(
+                    HTTPUIFieldOption("name:asc", "Name asc"),
+                    HTTPUIFieldOption("name:desc", "Name desc"),
+                    HTTPUIFieldOption("last_updated_at:desc", "Updated desc"),
+                    HTTPUIFieldOption("last_updated_at:asc", "Updated asc"),
+                ),
+            ),
+            _number_field("offset", "Offset", "offset", placeholder="0", default="0"),
+            _number_field("limit", "Limit", "limit", placeholder="20", default="20"),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="blizzard-profile",
+        title="Blizzard Profile",
+        description="Query public Blizzard career data and render it with the dashen-profile layout.",
+        json_endpoint="/api/v2/blizzard-profile",
+        image_endpoint="/api/v2/blizzard-profile/image",
+        requires_target=False,
+        default_target_key="player_id",
+        fields=(
+            HTTPUIFieldSpec(
+                id="player_id",
+                label="Player",
+                payload_key="player_id",
+                placeholder="e.g. ABC or ABC#1234",
+                help_text="Exact BattleTag works best. Name-only queries may require a Blizzard ID if multiple public profiles match.",
+            ),
+            HTTPUIFieldSpec(
+                id="blizzard_id",
+                label="Blizzard ID",
+                payload_key="blizzard_id",
+                placeholder="Optional canonical career id",
+            ),
+            HTTPUIFieldSpec(
+                id="locale",
+                label="Locale",
+                payload_key="locale",
+                placeholder="zh-tw / en-us",
+                default="zh-tw",
+            ),
+            _select_field(
+                "profile_mode",
+                "Mode",
+                "mode",
+                default="quick",
+                options=(
+                    HTTPUIFieldOption("quick", "Quick Play"),
+                    HTTPUIFieldOption("competitive", "Competitive"),
+                ),
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="ow-guess",
+        title="OW 猜一猜",
+        description="猜一猜：地图、头像三阶段提示，另含威能、描述、技能和代表色题，限时45秒。",
+        json_endpoint="/api/v2/ow-guess/replies",
+        image_endpoint="",
+        requires_target=False,
+        fields=(
+            _select_field(
+                "question_type",
+                "题型",
+                "question_type",
+                default="map_crop",
+                help_text="支持地图、英雄、技能和代表色题；答案仅供机器人结算使用。",
+                options=(
+                    HTTPUIFieldOption("map_crop", "地图局部 · 三阶段"),
+                    HTTPUIFieldOption("map_blur", "地图模糊 · 三阶段"),
+                    HTTPUIFieldOption("perk_icon_hero", "威能猜英雄"),
+                    HTTPUIFieldOption("hero_crop", "头像猜英雄 · 三阶段"),
+                    HTTPUIFieldOption("hero_description", "英雄描述猜英雄 · 三条线索"),
+                    HTTPUIFieldOption("skill_description_hero", "技能描述猜英雄"),
+                    HTTPUIFieldOption("skill_description_name", "技能描述猜技能名"),
+                    HTTPUIFieldOption("hero_color", "代表色猜英雄"),
+                    HTTPUIFieldOption("map_music", "地图音乐 · 需安装扩展包"),
+                    HTTPUIFieldOption("hero_conversation", "对话猜接话英雄 · 需安装扩展包"),
+                    HTTPUIFieldOption("random", "随机"),
+                ),
+            ),
+        ),
+    ),
+    HTTPUIModuleSpec(
+        id="ow-shop",
+        title="OW 商店",
+        description="查看当前商店，不需要玩家目标。",
+        json_endpoint="/api/v2/ow-shop",
+        image_endpoint="/api/v2/ow-shop/image",
+        requires_target=False,
+    ),
+    HTTPUIModuleSpec(
+        id="patch-notes",
+        title="补丁说明",
+        description="大小补丁均默认一张精简改动图，增强、削弱、调整分色；支持章节与英雄查询。",
+        json_endpoint="/api/v2/patch-notes",
+        image_endpoint="/api/v2/patch-notes/image",
+        requires_target=False,
+        fields=(
+            _select_field("view", "阅读视图", "view", default="auto", options=(
+                HTTPUIFieldOption("auto", "自动（精简改动图）"),
+                HTTPUIFieldOption("overview", "一图速读（英雄改动全量）"),
+                HTTPUIFieldOption("detail", "完整正文分页"),
+            )),
+            HTTPUIFieldSpec(id="section", label="章节", payload_key="section", placeholder="目录编号 s1 或章节名称"),
+            HTTPUIFieldSpec(id="hero", label="英雄", payload_key="hero", placeholder="例如：路霸"),
+            _number_field("page", "页码", "page", default="1"),
+            HTTPUIFieldSpec(id="patch_id", label="固定补丁", payload_key="patch_id", placeholder="可留空；翻页按钮自动固定版本"),
+            _select_field(
+                "patch_kind",
+                "补丁类型",
+                "patch_kind",
+                default="latest",
+                options=(
+                    HTTPUIFieldOption("latest", "最新"),
+                    HTTPUIFieldOption("small", "小更新"),
+                    HTTPUIFieldOption("big", "大更新"),
+                ),
+            ),
+        ),
+    ),
+)
+
+
+def get_http_ui_module_specs() -> Tuple[HTTPUIModuleSpec, ...]:
+    return HTTP_UI_MODULE_SPECS
+
+
+def get_http_ui_bootstrap_payload() -> Dict[str, Any]:
+    modules = [item.to_dict() for item in HTTP_UI_MODULE_SPECS]
+    return {
+        "default_module_id": HTTP_UI_MODULE_SPECS[0].id if HTTP_UI_MODULE_SPECS else "",
+        "modules": modules,
+    }

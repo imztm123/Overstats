@@ -1,0 +1,78 @@
+# ============================================================
+# Overstats 后端 · 自用改版仓库
+# 目标：敏感配置 / 数据库 / 缓存 / 备份一律不进版本库
+# ============================================================
+
+# ---------- 敏感配置（真实 token、API Key 只放本地） ----------
+config/config.py
+config/config.local.py
+.env
+.env.*
+!.env.example
+
+# ---------- 数据库 / 运行时数据 ----------
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3.old
+data/
+/data/
+
+# ---------- 备份 / 临时文件 ----------
+*.bak
+*.bak.*
+*.orig
+*.rej
+*.tmp
+*.temp
+*.swp
+*~
+*.log
+logs/
+
+# ---------- Python ----------
+__pycache__/
+*.py[codz]
+*.so
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+requirements.local.txt
+
+# ---------- 缓存 / 素材运行时目录 ----------
+res/cache_img/
+res/query_tool_assets/
+res/disabled_accounts.json
+src/modules/dashen_summary/runtime/cache/
+ow_guess_assets/
+cache/*.json
+cache/*.sqlite3
+
+# ---------- 测试产物 ----------
+test/
+tests/
+test_*.py
+*_test.py
+test_*.json
+test_*.md
+test_report_*.md
+api_test_data.json
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.qoder/
+.codebuddy/
+.workbuddy/
+.vibe/
+.DS_Store
+Thumbs.db
+desktop.ini
