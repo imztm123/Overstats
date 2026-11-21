@@ -25,14 +25,16 @@ SHOW_DASHEN_PROMO = False
 HERO_MODULE_MODE = 0
 
 # ======================= Dashen Upstream =================== #
-# 至少配置一个网易大神账号；配置多个账号时请求会在账号池内轮询分摊，
-# 可显著提升跨海查询战绩 / 竞技强度的响应速度。
+# 至少配置一个网易大神账号。上游（Overstats）本身支持账号池轮询：
+# 配置多个账号后请求会在池内分摊，跨海查询吞吐随之提高，无需额外代码改动。
+# 账号越多，下面两个并发参数才可以按「≤ 账号数 × 4」相应上调。
 DASHEN_ACCOUNTS = [
     {
         'name': 'account-1',
         'role_id': 123456789,
         'token': 'replace-with-your-token',
     },
+    # 有第二个账号时取消注释即可参与轮询：
     # {
     #     'name': 'account-2',
     #     'role_id': 987654321,
@@ -43,8 +45,8 @@ DASHEN_ACCOUNTS = [
 DASHEN_DTS = 2026
 DASHEN_SERVER = 1
 
-# 单账号每秒请求上限（上游默认 5，本自用版调到 8）
-DASHEN_ACCOUNT_MAX_REQUESTS_PER_SECOND = 8
+# 单账号每秒请求上限（上游默认 5，单账号建议保持默认）
+DASHEN_ACCOUNT_MAX_REQUESTS_PER_SECOND = 5
 DASHEN_ACCOUNT_RATE_LIMIT_WINDOW_SECONDS = 1.0
 
 DASHEN_CLIENT_TYPE = "60"
@@ -59,8 +61,8 @@ DASHEN_USER_AGENT = (
 # 账号被上游限流 / 失效后的冷却秒数
 DASHEN_ACCOUNT_FAILURE_COOLDOWN_SECONDS = 60
 
-# 进程内全局并发请求上限（上游默认 2，本自用版调到 14）
-DASHEN_MAX_CONCURRENT_REQUESTS = 14
+# 进程内全局并发请求上限（上游默认 2）
+DASHEN_MAX_CONCURRENT_REQUESTS = 2
 # 上游 v2 接口对「账号池大小 * 4」（排队 + 活跃）以上直接返回 429
 DASHEN_MAX_ACCEPTED_REQUESTS = max(len(DASHEN_ACCOUNTS) * 4, 1)
 

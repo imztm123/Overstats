@@ -27,7 +27,7 @@ MAX_MATCH_LIMIT = 12
 MAX_SCORE_LOOKBACK = 1
 DEFAULT_SCORE_LOOKBACK = MAX_SCORE_LOOKBACK
 DEFAULT_STREAK_HISTORY_PAGES = 1
-DEFAULT_MATCH_CONCURRENCY = 12
+DEFAULT_MATCH_CONCURRENCY = 4
 
 def match_hero_usage(data: Dict[str, Any], source_match: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Heroes the queried player used in a match, most played first, with their share of match time.
